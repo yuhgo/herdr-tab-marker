@@ -6,6 +6,15 @@
 
 作成日: 2026-08-13 / 調査環境: macOS, herdr 0.7.3
 
+## 完了までにやること
+
+1. 本体を実装する（§5）
+2. **dotfiles の設定を `herdr-auto-title` から差し替える（§5-6）**
+
+**2 をやるまで本実装は動かない。** 現在 dotfiles には上流 `herdr-auto-title` が
+登録されたままで、両者は同じタブ名を奪い合うので併存もできない（§5-4）。
+「実装できた」で終わらせず、必ず §5-6 の差し替えまで完了させること。
+
 ---
 
 ## 1. 何を作るのか
@@ -282,17 +291,15 @@ cwd は hook 入力の `cwd` フィールドから取れる。
 `HERDR_TAB_MARKER_TITLE=0` で「絵文字だけ・LLM なし」で使えるようにしておくと、
 コストゼロで運用したい人にも使ってもらえる。
 
-### 5-4. 上流との共存をどうするか（**未決定・要判断**）
+### 5-4. 上流との共存はしない（乗り換える）
 
 現在 dotfiles には `herdr-auto-title` が導入済みで、**両方入れると同じ label を奪い合う**。
 
-選択肢:
+併存案（本実装を `HERDR_TAB_MARKER_TITLE=0` の絵文字のみにして、タイトルは上流に任せる）は
+**破綻する**。上流は「自分が付けた名前でなければ上書きしない」設計なので、
+こちらが絵文字を足した時点で上流がそれを**手動ラベルと誤認して黙る**。
 
-- **A: 乗り換え** — `herdr-auto-title` の hook 登録を外し、本実装に一本化（すっきりする）
-- **B: 併存** — 本実装を `HERDR_TAB_MARKER_TITLE=0`（絵文字のみ）にして、タイトルは上流に任せる
-  - ただし上流は自分が付けた名前でないと上書きしないので、絵文字を足すと上流が「手動ラベル」と誤認して止まる可能性が高い。**おそらく破綻する**
-
-→ **A（乗り換え）が素直。** 実装が動いたら dotfiles 側の hook 登録を差し替える。
+→ **乗り換える。** 実装が動いたら dotfiles 側の登録を差し替える。手順は §5-6。
 
 ### 5-5. install.sh を書くときの注意（**dotfiles 環境固有・重要**）
 
@@ -315,7 +322,85 @@ cwd は hook 入力の `cwd` フィールドから取れる。
 のどちらかが良い。汎用リポジトリとして公開するなら前者が親切だが、
 **自分の環境で使う分には後者で十分**。
 
-### 5-6. テスト方針
+### 5-6. dotfiles 側の差し替え手順（**実装が動いたら必ずやる**）
+
+実装が動いても、**dotfiles の設定を差し替えるまで本実装は起動しない**。
+現在は `herdr-auto-title` が登録されたままなので、以下を漏れなく実施する。
+
+対象 dotfiles: `~/ghq/github.com/yuhgo/dotfiles`（`~/.claude` はここへの symlink）
+
+#### 差し替える箇所（2026-08-13 時点で全 7 箇所）
+
+| # | ファイル | 行 | 現在の内容 | 差し替え後 |
+|---|---------|-----|-----------|-----------|
+| 1 | `claude/settings.mac.json` | 13 | `"HERDR_AUTO_TITLE_LANG": "ja",` | `"HERDR_TAB_MARKER_LANG": "ja",` |
+| 2 | `claude/settings.mac.json` | 178 | `python3 '/Users/yamamotoyugo/.claude/hooks/herdr-auto-title.py'` | `python3 '/Users/yamamotoyugo/.claude/hooks/herdr-tab-marker.py'` |
+| 3 | `claude/settings.wsl.json` | 6 | `"HERDR_AUTO_TITLE_LANG": "ja",` | `"HERDR_TAB_MARKER_LANG": "ja",` |
+| 4 | `claude/settings.wsl.json` | 184 | `python3 '/home/yugo-yamamoto/.claude/hooks/herdr-auto-title.py'` | `python3 '/home/yugo-yamamoto/.claude/hooks/herdr-tab-marker.py'` |
+| 5 | `.gitignore` | 145-146 | `claude/herdr-auto-title/` | `claude/herdr-tab-marker/` |
+| 6 | `claude/AGENTS.md` | 171 | 設定ファイル表の `hooks/herdr-auto-title.py` の行 | 本実装の行に差し替え |
+| 7 | `claude/AGENTS.md` | 177-195 | 「herdr 連携（herdr-auto-title / 2026-08-13 導入）」節 | 本実装の内容に全面改訂 |
+
+> 行番号は 2026-08-13 時点。ずれている可能性があるので
+> `grep -rn "herdr-auto-title\|HERDR_AUTO_TITLE" claude/ .gitignore` で**実際に確認してから**直すこと。
+
+#### 手順
+
+```sh
+cd ~/ghq/github.com/yuhgo/dotfiles
+
+# 1. 本実装を dotfiles に配置（~/.claude は dotfiles への symlink なので追跡下に入る）
+cp ~/ghq/github.com/yuhgo/herdr-tab-marker/herdr_tab_marker.py \
+   claude/hooks/herdr-tab-marker.py
+chmod +x claude/hooks/herdr-tab-marker.py
+
+# 2. 旧 hook を削除
+git rm claude/hooks/herdr-auto-title.py
+
+# 3. 上の表 1〜7 を Edit で差し替え（settings は手で編集する。理由は §5-5）
+
+# 4. 旧 state を掃除（残っていても無害だが紛らわしい）
+rm -rf ~/.claude/herdr-auto-title/
+
+# 5. JSON が壊れていないか確認
+python3 -c "import json;[json.load(open(f)) for f in ['claude/settings.mac.json','claude/settings.wsl.json']];print('OK')"
+```
+
+#### 注意点
+
+- **settings は必ず dotfiles 側（`settings.mac.json` / `settings.wsl.json`）を編集する。**
+  `~/.claude/settings.json` は symlink なので直接触らない
+- **Mac / WSL の両方**を直す。片方だけだともう一方の環境で旧 hook を呼びに行って動かなくなる
+- **hook の `command` は絶対パス**（Mac: `/Users/yamamotoyugo/...`、WSL: `/home/yugo-yamamoto/...`）。
+  既存の `herdr-agent-state.sh` の表記に合わせている
+- 反映は**次に起動するセッションから**
+- WSL 側で clone は不要。`.py` が dotfiles 追跡下なので `git pull` だけで届く
+
+#### 差し替え後の確認
+
+```sh
+# 登録が入れ替わったか
+grep -rn "herdr-auto-title\|HERDR_AUTO_TITLE" ~/ghq/github.com/yuhgo/dotfiles/claude/ \
+  && echo "★ まだ残っている" || echo "OK: 旧参照なし"
+
+# 新セッションを herdr 内で起動し、タブ名に絵文字が付くか目視
+# 動かないときは HERDR_TAB_MARKER_DEBUG=1 で ~/.claude/herdr-tab-marker/debug.log を見る
+```
+
+#### ロールバック
+
+旧 hook は git 履歴に残るので、問題があれば戻せる。
+
+```sh
+cd ~/ghq/github.com/yuhgo/dotfiles
+git revert <差し替えコミット>     # または
+git checkout <差し替え前のコミット> -- claude/hooks/herdr-auto-title.py claude/settings.mac.json claude/settings.wsl.json
+```
+
+上流の `herdr-auto-title` 自体は `~/ghq/github.com/sh1ma/herdr-auto-title` に残るので、
+`cp herdr_auto_title.py <dotfiles>/claude/hooks/herdr-auto-title.py` で戻すこともできる。
+
+### 5-7. テスト方針
 
 上流は `python3 -m unittest discover -s tests` + `ruff` + `shellcheck` の構成。
 同じで良い。純粋関数（`marker_for` / `strip_marker` / `truncate` / `sanitize_title` /

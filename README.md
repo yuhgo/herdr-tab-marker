@@ -12,6 +12,10 @@
 > **status: 未実装**
 > リポジトリを作った直後の状態。設計と調査結果は [HANDOFF.md](HANDOFF.md) にある。
 > 開発を始めるときはまずそちらを読むこと。
+>
+> 実装後は dotfiles 側の hook 登録を
+> [sh1ma/herdr-auto-title](https://github.com/sh1ma/herdr-auto-title) から
+> 差し替える必要がある（手順は HANDOFF.md §5-6）。両者は同じタブ名を奪い合うため併存できない。
 
 ## なぜ絵文字なのか
 
