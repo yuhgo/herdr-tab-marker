@@ -129,7 +129,7 @@ cat ~/.claude/herdr-tab-marker/debug.log
 ## 開発
 
 ```sh
-python3 -m unittest discover -s tests   # 104 tests
+python3 -m unittest discover -s tests   # 114 tests
 uvx ruff check .
 ```
 

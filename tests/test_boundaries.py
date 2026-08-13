@@ -389,5 +389,143 @@ class TestTitleDisabledMode(unittest.TestCase):
             fake.close()
 
 
+class TestManualLabelIntegration(unittest.TestCase):
+    """手動ラベル保護を run() 経由で一巡させる統合テスト。
+
+    「タイトルは尊重、絵文字は付ける」が本実装の中核なので、
+    純粋関数のテストだけでなく通しでも固定する。
+    """
+
+    def _run(self, current_label, title_enabled=True):
+        fake = FakeHerdr({"result": {"tab": {"label": current_label}}})
+        state_dir = Path(tempfile.mkdtemp())
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HERDR_SOCKET_PATH": fake.path,
+                    "HERDR_TAB_ID": "w1:t4",
+                    "HOME": tempfile.mkdtemp(),
+                },
+                clear=True,
+            ), mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", title_enabled), \
+                 mock.patch.object(htm, "generate_title") as generate, \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                generate.return_value = "生成されたタイトル"
+                htm.run({"session_id": "s1", "cwd": os.getcwd()})
+            return generate, rename
+        finally:
+            fake.close()
+
+    def test_manual_label_keeps_title_but_gains_marker(self):
+        generate, rename = self._run("ssh")
+        # 手動ラベルなので LLM は呼ばない（コストゼロ）
+        generate.assert_not_called()
+        # 絵文字だけ付く
+        self.assertEqual(rename.call_count, 1)
+        new_label = rename.call_args[0][1]
+        self.assertTrue(new_label.endswith(" ssh"), new_label)
+        self.assertNotEqual(new_label, "ssh")
+
+    def test_default_numeric_label_is_replaced_by_title(self):
+        generate, rename = self._run("4")
+        generate.assert_called_once()
+        new_label = rename.call_args[0][1]
+        self.assertTrue(new_label.endswith("生成されたタイトル"), new_label)
+        # 連番は残さない
+        self.assertNotIn("4", new_label)
+
+    def test_already_marked_manual_label_is_not_double_marked(self):
+        # 前回 marker を付けた状態で再実行しても increment しない
+        repo = htm.detect_repo(os.getcwd())
+        marker = htm.marker_for(repo, {})
+        generate, rename = self._run(f"{marker} ssh")
+        generate.assert_not_called()
+        rename.assert_not_called()  # 変化なしなので rename も呼ばない
+
+
+class TestMarkerPersistence(unittest.TestCase):
+    """state に使った絵文字を記録し、MAP 変更後も剥がせること。
+
+    記録が漏れると `🔧 dotfiles` が手動ラベルと誤認され、
+    以後そのタブのタイトルが永久に更新されなくなる。
+    """
+
+    def _run_once(self, state_dir, current_label, marker_map_json, home):
+        fake = FakeHerdr({"result": {"tab": {"label": current_label}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": home,
+            }
+            if marker_map_json:
+                env["HERDR_TAB_MARKER_MAP"] = marker_map_json
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", False), \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                htm.run({"session_id": "s1", "cwd": os.getcwd()})
+            return rename
+        finally:
+            fake.close()
+
+    def test_marker_is_recorded_in_state(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        repo = htm.detect_repo(os.getcwd())
+        self._run_once(state_dir, "4", f'{{"{repo}":"🔧"}}', home)
+        state = htm.load_state(state_dir / "s1.json")
+        self.assertEqual(
+            state.get("marker"), "🔧", "使った絵文字が state に記録されていない"
+        )
+
+    def test_removed_map_value_is_still_stripped(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        repo = htm.detect_repo(os.getcwd())
+        # 1 回目: MAP ありで 🔧 を付ける
+        self._run_once(state_dir, "4", f'{{"{repo}":"🔧"}}', home)
+        # 2 回目: MAP を消した状態で、🔧 が付いたラベルを渡す
+        rename = self._run_once(state_dir, "🔧 手動の名前", None, home)
+        self.assertEqual(rename.call_count, 1)
+        new_label = rename.call_args[0][1]
+        # 🔧 は剥がされ、パレット由来の絵文字に貼り替わる
+        self.assertNotIn("🔧", new_label)
+        self.assertTrue(new_label.endswith("手動の名前"), new_label)
+        # 二重に絵文字が付いていない
+        self.assertEqual(htm.display_width(new_label), 2 + 1 + htm.display_width("手動の名前"))
+
+
+class TestDaemonizeFailure(unittest.TestCase):
+    def test_fork_failure_falls_back_to_foreground(self):
+        """fork に失敗しても hook 全体を落とさない。
+
+        daemonize は「hook をブロックしないため」の仕組みなので、
+        それ自体の失敗で prompt が止まっては本末転倒。
+        """
+        with mock.patch.dict(
+            os.environ,
+            {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/x.sock"},
+            clear=True,
+        ), mock.patch("sys.stdin.read", return_value="{}"), \
+             mock.patch("os.fork", side_effect=OSError("cannot fork")), \
+             mock.patch.object(htm, "run") as run:
+            self.assertEqual(htm.main(), 0)
+        # fork できなくても処理自体は前景で走る
+        run.assert_called_once()
+
+    def test_unexpected_error_in_run_is_swallowed(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/x.sock"},
+            clear=True,
+        ), mock.patch("sys.stdin.read", return_value="{}"), \
+             mock.patch.object(htm, "daemonize"), \
+             mock.patch.object(htm, "run", side_effect=RuntimeError("boom")):
+            self.assertEqual(htm.main(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

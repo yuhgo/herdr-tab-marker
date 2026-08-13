@@ -195,6 +195,29 @@ class TestStripMarker(unittest.TestCase):
         marker = htm.PALETTE[0]
         self.assertEqual(htm.strip_marker(f"ssh {marker}", {}), f"ssh {marker}")
 
+    def test_strips_previously_used_marker(self):
+        """MAP から消えた絵文字も、以前使ったものなら剥がせる。
+
+        `{"dotfiles":"🔧"}` を設定していたタブ名 `🔧 dotfiles` が残った状態で
+        MAP を削除すると、剥がせないまま手動ラベルと誤認されて
+        以後タイトル生成が永久に止まってしまう。
+        """
+        self.assertEqual(
+            htm.strip_marker("🔧 dotfiles", {}, previous_marker="🔧"), "dotfiles"
+        )
+
+    def test_previous_marker_none_is_harmless(self):
+        marker = htm.PALETTE[0]
+        self.assertEqual(
+            htm.strip_marker(f"{marker} x", {}, previous_marker=None), "x"
+        )
+
+    def test_previous_marker_does_not_widen_to_unknown(self):
+        # 記録済みのもの以外は依然として剥がさない
+        self.assertEqual(
+            htm.strip_marker("🦄 unicorn", {}, previous_marker="🔧"), "🦄 unicorn"
+        )
+
 
 class TestMayOverwriteTitle(unittest.TestCase):
     def test_empty_is_overwritable(self):

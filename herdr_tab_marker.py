@@ -197,16 +197,25 @@ def marker_for(repo: str | None, marker_map: dict) -> str | None:
     return PALETTE[_digest(repo) % len(PALETTE)]
 
 
-def known_markers(marker_map: dict) -> tuple:
+def known_markers(marker_map: dict, previous_marker: str | None = None) -> tuple:
     """自分が付けうる絵文字の一覧。
 
     「絵文字とは何か」を正規表現で書き切るのは無理なので、
     剥がす対象を自分が付けうるものだけに限定する（HANDOFF.md §5-2）。
+
+    previous_marker には state に記録した「前回このタブに付けた絵文字」を渡す。
+    HERDR_TAB_MARKER_MAP から値を消したあとでも、それで付けたタブ名を剥がせるようにするため。
+    渡さないと `🔧 dotfiles` が手動ラベルと誤認され、以後タイトルが更新されなくなる。
     """
-    return tuple(PALETTE) + tuple(marker_map.values())
+    markers = tuple(PALETTE) + tuple(marker_map.values())
+    if previous_marker and previous_marker not in markers:
+        markers += (previous_marker,)
+    return markers
 
 
-def strip_marker(label: str | None, marker_map: dict) -> str:
+def strip_marker(
+    label: str | None, marker_map: dict, previous_marker: str | None = None
+) -> str:
     """タブ名の先頭から自分が付けた絵文字を剥がす。
 
     毎回先頭に足すと 🟦🟦🟦 と積み上がるので、貼り替える前に剥がす。
@@ -214,7 +223,7 @@ def strip_marker(label: str | None, marker_map: dict) -> str:
     if not label:
         return ""
     text = label
-    markers = known_markers(marker_map)
+    markers = known_markers(marker_map, previous_marker)
     changed = True
     while changed:
         changed = False
@@ -623,8 +632,9 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     log(f"tab={tab_id} repo={repo!r} marker={marker!r} prompt={prompt_count}")
 
     current_label = get_tab_label(tab_id)
-    # 手動ラベル判定は絵文字を剥がしてから行う
-    current_title = strip_marker(current_label, marker_map)
+    # 手動ラベル判定は絵文字を剥がしてから行う。
+    # 前回付けた絵文字も剥がす対象に含める（MAP から値を消しても取り残さないため）
+    current_title = strip_marker(current_label, marker_map, state.get("marker"))
 
     budget = title_budget(MAX_WIDTH, marker)
     # 既定ラベル（連番）は持ち回らない。残すと `🟦 5` のような残骸になる
@@ -661,6 +671,8 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         return
     if rename_tab(tab_id, new_label):
         state["tab_id"] = tab_id
+        # 次回この絵文字を剥がせるように覚えておく（MAP を変更されても取り残さない）
+        state["marker"] = marker
         state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         save_state(path, state)
         log(f"renamed {current_label!r} -> {new_label!r}")
@@ -668,13 +680,20 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         log(f"rename to {new_label!r} failed")
 
 
-def daemonize() -> None:
+def daemonize() -> bool:
     """親を即座に終了させ、以降の処理を Claude Code から切り離して続ける。
 
     タイトル生成に数秒かかるので、hook をブロックしたままにしない。
+
+    fork できなかった場合は False を返す。daemonize は「hook を止めないため」の
+    仕組みなので、その失敗自体で prompt を止めては本末転倒になる。
     """
-    if os.fork() > 0:
-        os._exit(0)
+    try:
+        if os.fork() > 0:
+            os._exit(0)
+    except OSError as exc:
+        log(f"cannot fork ({exc}); continuing in foreground")
+        return False
     os.setsid()
     devnull = os.open(os.devnull, os.O_RDWR)
     os.dup2(devnull, 0)
@@ -682,6 +701,7 @@ def daemonize() -> None:
     os.dup2(devnull, 2)
     if devnull > 2:
         os.close(devnull)
+    return True
 
 
 def main() -> int:
@@ -712,10 +732,12 @@ def main() -> int:
         run(hook_input)
         return 0
 
+    # fork できなくてもそのまま前景で続ける。数秒 hook を待たせるほうが、
+    # タブ名が付かないより望ましい
     daemonize()
     try:
         run(hook_input)
-    except Exception as exc:  # デーモン側で落ちても hook 本体には影響させない
+    except Exception as exc:  # 落ちても hook 本体には影響させない
         log(f"unexpected error: {exc!r}")
     return 0
 
