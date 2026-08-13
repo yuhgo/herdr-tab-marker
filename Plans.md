@@ -99,7 +99,7 @@ HANDOFF.md §5-6。**実装完了だけで終わらせない。** 7 箇所すべ
 | Task | 内容 | DoD | Depends | Status |
 |------|------|-----|---------|--------|
 | 5.1 | `[lane:gate]` `[tdd:skip:review-task]` 実装レビュー（`harness-review` 相当）。特に「ハッシュ安定性」「マーカー剥がしの取りこぼし」「自己再入防止」を重点確認 | review artifact が残り、指摘が解消または理由付きで受容されている | 4.5 | cc:完了 |
-| 5.2 | `[lane:fast]` `[tdd:skip:docs-only]` 実装内容の Artifact を書き出す（ユーザー依頼分）。何をどう作ったかを図解付きでまとめる | Artifact が publish され URL がユーザーに渡っている | 5.1 | cc:TODO |
+| 5.2 | `[lane:fast]` `[tdd:skip:docs-only]` 実装内容の Artifact を書き出す（ユーザー依頼分）。何をどう作ったかを図解付きでまとめる | Artifact が publish され URL がユーザーに渡っている | 5.1 | cc:完了 |
 
 ---
 
