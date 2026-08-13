@@ -8,3 +8,6 @@ venv/
 
 # harness-mem ランタイムデータ
 .harness-mem/
+
+# harness の進捗スナップショット（生成物）
+out/

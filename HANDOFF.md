@@ -75,6 +75,10 @@
 
 **herdr 0.7.3 で実機確認済み。** 一次情報は herdr 本体の実装。
 
+> **2026-08-13 実装前に再確認済み。** herdr 0.7.3 の RPC は依然 **72 メソッド**、
+> `tab.*` は 7 つ、color / style / icon / theme に相当するメソッドは **0 件**。
+> 絵文字方式（§2）の前提は変わっていない。
+
 ### 3-1. RPC メソッドは全 72 個、タブの色を設定する口は無い
 
 存在しないメソッド名を投げるとエラーに全メソッド名が列挙されるので、そこから取得した。
@@ -287,6 +291,11 @@ cwd は hook 入力の `cwd` フィールドから取れる。
 | `HERDR_TAB_MARKER_REGEN_EVERY` | 0 | タイトル再生成の間隔 |
 | `HERDR_TAB_MARKER_MODEL` | `haiku` | タイトル生成モデル |
 | `HERDR_TAB_MARKER_DEBUG` | `0` | `~/.claude/herdr-tab-marker/debug.log` に出力 |
+| `HERDR_TAB_MARKER_FOREGROUND` | `0` | daemonize せず前景実行（§5-7 のデバッグ用。実装済み） |
+| `HERDR_TAB_MARKER_MAX_BUDGET_USD` | `0.05` | 1 回あたりのコスト上限 |
+| `HERDR_TAB_MARKER_TIMEOUT_SEC` | `90` | タイトル生成のタイムアウト |
+| `HERDR_TAB_MARKER_MAX_LOG_CHARS` | `1500` | LLM に渡す会話ログの上限 |
+| `HERDR_TAB_MARKER_DISABLE` | `0` | 一時的に無効化 |
 
 `HERDR_TAB_MARKER_TITLE=0` で「絵文字だけ・LLM なし」で使えるようにしておくと、
 コストゼロで運用したい人にも使ってもらえる。
