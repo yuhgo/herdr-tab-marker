@@ -1,6 +1,6 @@
 """純粋関数層のテスト。
 
-ソケットも LLM も要らない関数だけを対象にする（HANDOFF.md §5-7）。
+ソケットも LLM も要らない関数だけを対象にする。
 """
 
 import subprocess
@@ -27,7 +27,7 @@ class TestDisplayWidth(unittest.TestCase):
         self.assertEqual(htm.display_width(""), 0)
 
     def test_emoji_counts_two(self):
-        # マーカーに使う絵文字は 2 カラム見当で幅を配分する（HANDOFF.md §5-2）
+        # マーカーに使う絵文字は 2 カラム見当で幅を配分する
         self.assertEqual(htm.display_width("🟦"), 2)
 
 
@@ -115,7 +115,7 @@ class TestMarkerFor(unittest.TestCase):
     def test_stable_across_processes(self):
         """組み込み hash() は PYTHONHASHSEED で変わるので使っていないことの確認。
 
-        HANDOFF.md §5-2 が明示的に禁じている罠。別プロセスで seed を変えて実行し、
+        絵文字が実行ごとに変わると識別子として機能しない。別プロセスで seed を変えて実行し、
         同じ絵文字が返ることを確かめる。
         """
         root = str(Path(__file__).resolve().parent.parent)
@@ -174,7 +174,7 @@ class TestStripMarker(unittest.TestCase):
         self.assertEqual(htm.strip_marker("🔧 dotfiles", {"dotfiles": "🔧"}), "dotfiles")
 
     def test_leaves_unknown_emoji_alone(self):
-        """自分が付けうるものだけを剥がす（HANDOFF.md §5-2）。
+        """自分が付けうるものだけを剥がす。
 
         「絵文字とは何か」を正規表現で書き切ろうとしない方針の確認。
         """
@@ -237,7 +237,7 @@ class TestMayOverwriteTitle(unittest.TestCase):
         self.assertFalse(htm.may_overwrite_title("ssh", "認証調査"))
 
     def test_judged_after_strip(self):
-        """HANDOFF.md §5-2: 剥がしてから判定しないと前回の自分の名前を誤認する。"""
+        """剥がしてから判定しないと前回の自分の名前を誤認する。"""
         marker = htm.PALETTE[0]
         previous = "認証調査"
         labelled = f"{marker} {previous}"
@@ -289,7 +289,7 @@ class TestComposeLabel(unittest.TestCase):
 
 class TestTitleBudget(unittest.TestCase):
     def test_marker_reserves_three_columns(self):
-        """絵文字 2 カラム + 空白 1 = 3 を引く（HANDOFF.md §5-2）。"""
+        """絵文字 2 カラム + 空白 1 = 3 を引く。"""
         self.assertEqual(htm.title_budget(28, "🟦"), 25)
 
     def test_no_marker_uses_full_width(self):

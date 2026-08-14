@@ -7,7 +7,7 @@
     └──── 作業中のリポジトリから決まる（コストゼロ・常に付ける）
 
 herdr 0.7.3 にはタブ個別の色を設定する API が無く、外部から触れるのは label だけなので、
-色の代わりに絵文字で視覚的な弁別性を得ている。設計の経緯は HANDOFF.md を参照。
+色の代わりに絵文字で視覚的な弁別性を得ている（herdr 0.7.3 で確認）。
 
 Claude Code / Codex の UserPromptSubmit hook として呼ばれる。herdr の外では何もしない。
 
@@ -201,7 +201,7 @@ def known_markers(marker_map: dict, previous_marker: str | None = None) -> tuple
     """自分が付けうる絵文字の一覧。
 
     「絵文字とは何か」を正規表現で書き切るのは無理なので、
-    剥がす対象を自分が付けうるものだけに限定する（HANDOFF.md §5-2）。
+    剥がす対象を自分が付けうるものだけに限定する。
 
     previous_marker には state に記録した「前回このタブに付けた絵文字」を渡す。
     HERDR_TAB_MARKER_MAP から値を消したあとでも、それで付けたタブ名を剥がせるようにするため。
@@ -572,7 +572,7 @@ def may_overwrite_title(stripped_label: str | None, previous_title: str | None) 
     """このタイトル部分を上書きしてよいか判定する。
 
     必ず strip_marker を通した文字列を渡すこと。絵文字が付いたままだと
-    前回自分が付けた名前を手動ラベルと誤認する（HANDOFF.md §5-2）。
+    前回自分が付けた名前を手動ラベルと誤認する。
 
     上書きしてよいのは 3 つだけ:
       1. 空
@@ -659,7 +659,7 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         else:
             log("title generation produced nothing; keeping current title")
 
-    # 手動ラベルでもマーカーは付ける（HANDOFF.md §2）。ただし幅は超えないように詰める
+    # 手動ラベルでもマーカーは付ける。ただし幅は超えないように詰める
     title = truncate(title, budget) if title else ""
     new_label = compose_label(marker, title)
 

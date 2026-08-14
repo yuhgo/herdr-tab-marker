@@ -70,7 +70,7 @@ class TestHerdrCall(unittest.TestCase):
             fake.close()
 
     def test_request_id_is_a_string(self):
-        """herdr は数値 id を invalid_request で弾く（HANDOFF.md §3-5）。"""
+        """herdr は数値 id を invalid_request で弾く。"""
         fake = FakeHerdr({"id": "x", "result": {}})
         try:
             with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}):
@@ -139,7 +139,7 @@ class TestResolveTabId(unittest.TestCase):
             fake.close()
 
     def test_falls_back_to_env(self):
-        """古い herdr には HERDR_TAB_ID が無い場合がある（HANDOFF.md §3-6）の逆ケース。"""
+        """古い herdr には HERDR_TAB_ID が無い場合がある。その逆で、ソケットが死んでいるケース。"""
         with mock.patch.dict(
             os.environ,
             {"HERDR_SOCKET_PATH": "/nonexistent/x.sock", "HERDR_TAB_ID": "w1:t4"},
@@ -154,7 +154,7 @@ class TestResolveTabId(unittest.TestCase):
 
 class TestChildEnv(unittest.TestCase):
     def test_strips_herdr_vars(self):
-        """これを忘れると生成用の agent が自分の hook を呼び返す（HANDOFF.md §4-4）。"""
+        """これを忘れると生成用の agent が自分の hook を呼び返す。"""
         dirty = {
             "HERDR_ENV": "1",
             "HERDR_PANE_ID": "w1:p6",
@@ -194,7 +194,7 @@ class TestGenerateTitle(unittest.TestCase):
             self.assertEqual(htm.generate_title("log", htm.CLAUDE, 25), "")
 
     def test_uses_safe_mode_and_no_tools(self):
-        """--safe-mode が再入防止の要（HANDOFF.md §4-4）。"""
+        """--safe-mode が再入防止の要。hooks / plugins / MCP を読ませない。"""
         completed = mock.Mock(returncode=0, stdout="認証調査\n", stderr="")
         with mock.patch("subprocess.run", return_value=completed) as run:
             title = htm.generate_title("log", htm.CLAUDE, 25)
@@ -313,7 +313,7 @@ class TestMainGuards(unittest.TestCase):
         return code, run, daemonize
 
     def test_exits_outside_herdr(self):
-        """HERDR_ENV が無ければ即 exit 0（HANDOFF.md §3-6）。"""
+        """HERDR_ENV が無ければ即 exit 0。herdr の外では何もしない。"""
         code, run, _ = self._main_with({})
         self.assertEqual(code, 0)
         run.assert_not_called()
@@ -367,7 +367,7 @@ class TestMainGuards(unittest.TestCase):
 
 
 class TestTitleDisabledMode(unittest.TestCase):
-    """HERDR_TAB_MARKER_TITLE=0 は LLM を一切呼ばない（HANDOFF.md §5-3）。"""
+    """HERDR_TAB_MARKER_TITLE=0 は LLM を一切呼ばない。"""
 
     def test_no_subprocess_when_title_disabled(self):
         fake = FakeHerdr({"result": {"tab": {"label": "4"}}})

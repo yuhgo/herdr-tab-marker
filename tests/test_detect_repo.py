@@ -1,6 +1,6 @@
 """detect_repo のテスト。
 
-HANDOFF.md §5-2 の要点は「`--git-common-dir` を使い `--show-toplevel` を使わない」こと。
+要点は「`--git-common-dir` を使い `--show-toplevel` を使わない」こと。
 worktree で作業していても同じリポジトリ名（＝同じ絵文字）になる必要がある。
 """
 
