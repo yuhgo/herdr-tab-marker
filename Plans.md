@@ -89,7 +89,7 @@ HANDOFF.md §5-6。**実装完了だけで終わらせない。** 7 箇所すべ
 | 4.1 | `[lane:gate]` `[tdd:skip:deployment-step]` 本体を dotfiles へ配置。`cp herdr_tab_marker.py <dotfiles>/claude/hooks/herdr-tab-marker.py` + `chmod +x`。旧 hook を `git rm claude/hooks/herdr-auto-title.py` | 新 hook が dotfiles 追跡下にあり実行権限が付いている。旧 `.py` が削除されている | 3.2 | cc:完了 |
 | 4.2 | `[lane:gate]` `[tdd:skip:config-edit]` settings 2 ファイルを **Edit で手編集**（`json.dump` で書き戻さない。§5-5 の理由）。`HERDR_AUTO_TITLE_LANG` → `HERDR_TAB_MARKER_LANG`、hook command のパスを差し替え。**Mac / WSL 両方**やる | `python3 -c "import json;[json.load(open(f)) for f in [...]]"` が OK。diff が該当行のみ（キー順が並び替わっていない） | 4.1 | cc:完了 |
 | 4.3 | `[lane:fast]` `[tdd:skip:docs-only]` dotfiles の `.gitignore`（145-146 行）と `claude/AGENTS.md`（171 行 / 177-191 節）を本実装の内容に改訂 | `grep -rn "herdr-auto-title\|HERDR_AUTO_TITLE" claude/ .gitignore` が**ヒット 0 件** | 4.2 | cc:完了 |
-| 4.4 | `[lane:fast]` `[tdd:skip:cleanup]` 旧 state を掃除。`rm -rf ~/.claude/herdr-auto-title/` | ディレクトリが存在しない | 4.3 | blocked（rm が runtime floor で要承認。動作影響なし） |
+| 4.4 | `[lane:fast]` `[tdd:skip:cleanup]` 旧 state を掃除。`rm -rf ~/.claude/herdr-auto-title/` | ディレクトリが存在しない | 4.3 | cc:完了 |
 | 4.5 | `[lane:gate]` `[tdd:skip:manual-verification]` 差し替え後の確認（§5-6 の確認節）。旧参照 0 件 + 新セッションでタブ名に絵文字が付くことを目視 | 旧参照 grep が 0 件。新セッションで絵文字付きタブ名を確認（動かない場合は `HERDR_TAB_MARKER_DEBUG=1` で debug.log を確認） | 4.4 | cc:完了 |
 
 ---
