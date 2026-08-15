@@ -7,6 +7,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -316,6 +317,129 @@ class TestParseMarkerMap(unittest.TestCase):
 
     def test_drops_non_string_values(self):
         self.assertEqual(htm.parse_marker_map('{"a": 1, "b": "🔧"}'), {"b": "🔧"})
+
+
+class TestLooksLikeProse(unittest.TestCase):
+    """タイトルではなく地の文（拒否・説明）を弾けること。"""
+
+    def test_japanese_refusal(self):
+        self.assertTrue(htm.looks_like_prose("具体的な作業内容を特定することができません"))
+
+    def test_english_refusal(self):
+        self.assertTrue(
+            htm.looks_like_prose("This greeting alone does not provide enough context.")
+        )
+
+    def test_request_for_more_info(self):
+        self.assertTrue(htm.looks_like_prose("より詳細な会話ログをご提供ください"))
+
+    def test_sentence_punctuation_is_prose(self):
+        # システムプロンプトで句読点を禁じているので、あれば地の文
+        self.assertTrue(htm.looks_like_prose("認証を直しました。"))
+        self.assertTrue(htm.looks_like_prose("認証、ログイン、両方"))
+
+    def test_real_japanese_title_passes(self):
+        self.assertFalse(htm.looks_like_prose("ログイン画面バリデーション修正"))
+
+    def test_real_english_title_passes(self):
+        self.assertFalse(htm.looks_like_prose("Auth token refresh fix"))
+
+    def test_dotted_identifier_is_not_prose(self):
+        # settings.json のような識別子でピリオドを誤検知しないこと
+        self.assertFalse(htm.looks_like_prose("settings.json の修正"))
+
+
+class TestSanitizeTitleRejectsProse(unittest.TestCase):
+    def test_refusal_becomes_empty(self):
+        refusal = (
+            "申し訳ございませんが、提供いただいたログでは作業内容を特定できません。\n\n"
+            "作業セッションのログをご確認のうえ、再度ご提供いただけますでしょうか。"
+        )
+        self.assertEqual(htm.sanitize_title(refusal), "")
+
+    def test_english_refusal_becomes_empty(self):
+        raw = "This greeting alone does not provide enough context to determine the work."
+        self.assertEqual(htm.sanitize_title(raw), "")
+
+    def test_valid_title_survives(self):
+        self.assertEqual(htm.sanitize_title("認証エラーの調査"), "認証エラーの調査")
+
+    def test_prefix_is_still_stripped(self):
+        self.assertEqual(htm.sanitize_title("タイトル: 認証エラーの調査"), "認証エラーの調査")
+
+    def test_overlong_output_rejected(self):
+        # 予算の 2 倍を超える出力はタイトルではなく地の文とみなす
+        self.assertEqual(htm.sanitize_title("あ" * 100, 10), "")
+
+
+class TestIsGreetingOnly(unittest.TestCase):
+    """挨拶だけのときは LLM を呼ばず、タイトルを保留すること。"""
+
+    def test_japanese_greetings(self):
+        for text in ("こんにちは", "おはよう", "おはようございます", "お疲れ様です"):
+            self.assertTrue(htm.is_greeting_only(text), text)
+
+    def test_english_greetings(self):
+        for text in ("hello", "Hi!", "good morning", "thanks"):
+            self.assertTrue(htm.is_greeting_only(text), text)
+
+    def test_empty_is_greeting_only(self):
+        self.assertTrue(htm.is_greeting_only(""))
+
+    def test_all_lines_must_be_greetings(self):
+        self.assertTrue(htm.is_greeting_only("こんにちは\nおはよう"))
+
+    def test_work_prompt_is_not_greeting(self):
+        self.assertFalse(htm.is_greeting_only("ログイン画面のバリデーションを直して"))
+
+    def test_greeting_plus_work_is_not_greeting_only(self):
+        # 挨拶で始まっても作業の行があればタイトルを作る
+        self.assertFalse(htm.is_greeting_only("こんにちは\nログイン画面を直して"))
+
+    def test_greeting_with_trailing_work_on_same_line(self):
+        self.assertFalse(htm.is_greeting_only("こんにちは、ログインを直して"))
+
+
+class TestResolveLang(unittest.TestCase):
+    """明示指定 > ロケール > 既定 ja の順で決まること。
+
+    hook は環境変数もロケールも削がれた状態で起動されることがある。
+    そこで en に倒れると日本語利用者に英語タイトルが付くので、
+    「英語だと判別できたときだけ en」を守る。
+    """
+
+    def _resolve(self, raw, env=None, locale_name=""):
+        with mock.patch.dict(htm.os.environ, env or {}, clear=True):
+            with mock.patch.object(htm.locale, "getlocale", return_value=(locale_name, None)):
+                return htm._resolve_lang(raw)
+
+    def test_explicit_value_wins_over_locale(self):
+        self.assertEqual(self._resolve("en", {"LANG": "ja_JP.UTF-8"}), "en")
+        self.assertEqual(self._resolve("ja", {"LANG": "en_US.UTF-8"}), "ja")
+
+    def test_auto_follows_lang_env(self):
+        self.assertEqual(self._resolve("auto", {"LANG": "ja_JP.UTF-8"}), "ja")
+
+    def test_auto_follows_lc_all_env(self):
+        self.assertEqual(self._resolve("auto", {"LC_ALL": "ja_JP.UTF-8"}), "ja")
+
+    def test_auto_uses_en_only_when_locale_says_english(self):
+        self.assertEqual(self._resolve("auto", {}, locale_name="en_US"), "en")
+
+    def test_auto_defaults_to_ja_without_any_hint(self):
+        # 環境変数もロケールも無い hook 実行環境で英語に落ちないこと
+        self.assertEqual(self._resolve("auto", {}, locale_name=""), "ja")
+
+    def test_unknown_locale_defaults_to_ja(self):
+        self.assertEqual(self._resolve("auto", {}, locale_name="de_DE"), "ja")
+
+    def test_unknown_value_falls_back_to_locale_rules(self):
+        self.assertEqual(self._resolve("xx", {}, locale_name=""), "ja")
+
+    def test_broken_locale_does_not_raise(self):
+        with mock.patch.dict(htm.os.environ, {}, clear=True):
+            with mock.patch.object(htm.locale, "getlocale", side_effect=ValueError):
+                self.assertEqual(htm._resolve_lang("auto"), "ja")
 
 
 if __name__ == "__main__":

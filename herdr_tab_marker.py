@@ -58,7 +58,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _resolve_lang(raw: str) -> str:
-    """`auto` はロケール追従。それ以外は ja / en に丸める。"""
+    """`auto` はロケール追従。それ以外は ja / en に丸める。
+
+    ロケールが英語だと判別できたときだけ en にし、判別できなければ ja に倒す。
+    hook は環境変数が削がれた状態で起動されることがあり、そこで en に落ちると
+    日本語で使っているのに英語タイトルが付く。既定を ja に寄せて事故を防ぐ。
+    """
     value = raw.strip().lower()
     if value in (JA, EN):
         return value
@@ -70,7 +75,7 @@ def _resolve_lang(raw: str) -> str:
         current = locale.getlocale()[0] or ""
     except ValueError:
         current = ""
-    return JA if current.lower().startswith("ja") else EN
+    return EN if current.lower().startswith("en") else JA
 
 
 MARKER_ENABLED = _env_flag("MARKER", "1")
@@ -373,15 +378,49 @@ def rename_tab(tab_id: str, label: str) -> bool:
 # ---------------------------------------------------------------- 会話ログ
 
 
-def read_prompts(transcript_path: str | None, limit: int) -> str:
-    """transcript から user 発言だけを拾って連結する。"""
+# transcript には user ロールで書かれるが、ユーザーの意図ではない発言がある。
+# これらを混ぜるとタイトルが「作業内容が不明」のようなメタ文になるので除く。
+NOISE_PATTERNS = (
+    # Esc 中断などで Claude Code 自身が差し込む擬似発言
+    re.compile(r"^\[[^\]]*(interrupted|cancelled|canceled|no response)[^\]]*\]$", re.IGNORECASE),
+    # skill / slash command の本文。ユーザーが書いた文章ではない
+    re.compile(r"^Base directory for this skill\s*:", re.IGNORECASE),
+)
+
+# skill / slash command の本文は user ロールで数 KB〜十数 KB 差し込まれ、
+# 前置き行を持たないものもある。人が打つプロンプトの長さではないので、
+# 桁で切って落とす。落としすぎても、いま送信されたプロンプトは必ず残る。
+MAX_PROMPT_CHARS = 2000
+
+
+def is_noise_prompt(text: str) -> bool:
+    """user ロールだが会話の意図を表さない発言か。"""
+    if not text:
+        return True
+    # hook が挿入する system-reminder 等のタグ塊
+    if text.startswith("<"):
+        return True
+    return any(pattern.match(text) for pattern in NOISE_PATTERNS)
+
+
+def read_prompts(transcript_path: str | None, limit: int, current_prompt: str = "") -> str:
+    """transcript から user 発言だけを拾って連結する。
+
+    UserPromptSubmit の時点では、いま送信されたプロンプトが transcript に
+    まだ書かれていないことがある（特にセッション 1 通目）。hook 入力の
+    `prompt` を末尾に足して、最新の発言が必ずログに載るようにする。
+    """
+    current = (current_prompt or "").strip()
+    if is_noise_prompt(current):
+        current = ""
     if not transcript_path:
-        return ""
+        return current[-limit:] if current else ""
     try:
         raw = Path(transcript_path).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
+        # 履歴が読めなくても、いま送信されたプロンプトだけでタイトルは作れる
         log(f"cannot read transcript: {exc}")
-        return ""
+        return current[-limit:] if current else ""
     prompts: list[str] = []
     for line in raw.splitlines():
         line = line.strip()
@@ -405,12 +444,16 @@ def read_prompts(transcript_path: str | None, limit: int) -> str:
         else:
             continue
         text = text.strip()
-        # hook が挿入する system-reminder 等は会話の意図ではないので除く
-        if not text or text.startswith("<"):
+        # 現在のプロンプトと違い、履歴側は落としても最新の意図を失わない
+        if is_noise_prompt(text) or len(text) > MAX_PROMPT_CHARS:
             continue
         prompts.append(text)
+    # 最新の発言を必ず含める。transcript 側に既に載っていれば重複させない
+    if current and (not prompts or prompts[-1] != current):
+        prompts.append(current)
     joined = "\n".join(prompts)
-    return joined[:limit]
+    # 溢れるときは古い方を捨てる。直近の発言ほど今の作業を表す
+    return joined[-limit:]
 
 
 # ---------------------------------------------------------------- タイトル生成
@@ -430,18 +473,62 @@ SYSTEM_PROMPTS = {
 }
 
 
+# 挨拶だけの会話などでは、モデルがタイトルではなく「作業内容が特定できません」
+# という説明文を返す。これをそのまま採ると拒否文の断片がタブ名に焼き付き、
+# REGEN_EVERY=0 の既定では二度と直らない。タイトルらしさを検証して弾く。
+#
+# 判定は「タイトルなら現れないもの」を見る:
+#   - 文末の句点/ピリオド（システムプロンプトで禁止しているので、あれば地の文）
+#   - 読点や「が/ので/ため」等でつながる説明調の接続
+#   - 拒否・要求でよく出る定型語
+REFUSAL_RE = re.compile(
+    r"(申し訳|すみません|できません|できかね|特定でき|判断でき|不明です|"
+    r"情報が必要|提供いただ|ご確認|お教え|いただけれ|ください|"
+    r"I'm sorry|I am sorry|I apologize|cannot|can't|unable to|"
+    r"does not (provide|contain|include)|doesn't (provide|contain|include)|"
+    r"not enough|insufficient|no (specific|actual|clear) |"
+    r"please provide|need more|would need|appears to be (only|just))",
+    re.IGNORECASE,
+)
+
+# 説明文にだけ出る文末・接続の記号。タイトルは体言止め / noun phrase なので出ない。
+SENTENCE_RE = re.compile(r"[。．、，]|(?<=[a-zA-Z])\.(?:\s|$)")
+
+
+def looks_like_prose(title: str) -> bool:
+    """タイトルではなく地の文（拒否・説明）に見えるか。"""
+    if REFUSAL_RE.search(title):
+        return True
+    return bool(SENTENCE_RE.search(title))
+
+
 def sanitize_title(raw: str, max_width: int | None = None) -> str:
-    """モデル出力を 1 行のタブ名として使える形に整える。"""
+    """モデル出力を 1 行のタブ名として使える形に整える。
+
+    タイトルとして使えないと判断したときは空を返す。呼び出し側はそれを
+    「生成できなかった」として扱い、既存のタイトルを維持する。
+    """
     text = "".join(ch for ch in raw if ch == "\n" or unicodedata.category(ch)[0] != "C")
     # 空行を除いた最後の行を採る（思考めいた前置きが混ざった場合の保険）
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return ""
+    # 拒否文は複数行にわたることがある。1 行でも地の文が混じれば全体を捨てる
+    # （最終行だけ見ると「ご確認のうえ…」のような断片を拾ってしまう）
+    if any(looks_like_prose(line) for line in lines):
+        log(f"model returned prose, not a title: {lines[0][:80]!r}")
+        return ""
     title = PREFIX_RE.sub("", lines[-1]).strip(TRIM_CHARS)
     title = re.sub(r"\s+", " ", title)
     if not title:
         return ""
-    return truncate(title, MAX_WIDTH if max_width is None else max_width)
+    # 切り詰める前に長さを見る。タイトルなら収まるはずで、大きく溢れるなら地の文
+    budget = MAX_WIDTH if max_width is None else max_width
+    limit = max(budget, 1) * 2
+    if display_width(title) > limit:
+        log(f"model output too long for a title ({display_width(title)} > {limit})")
+        return ""
+    return truncate(title, budget)
 
 
 def detect_agent(hook_input: dict) -> str:
@@ -485,6 +572,29 @@ def user_message_for(conversation_log: str, agent: str) -> str:
     )
 
 
+# 挨拶・相槌だけの発言。これしか無い時点ではタイトルを付けようがない。
+GREETING_RE = re.compile(
+    r"^(おはよう(ございます)?|こんにちは|こんばんは|はじめまして|やあ|よろしく(お願いします)?|"
+    r"ありがとう(ございます)?|お疲れ(様|さま)?(です)?|ちょっといい\?|ping|test|"
+    r"hi|hello|hey|good (morning|afternoon|evening)|thanks|thank you|yo)"
+    r"[\s!！。．、,\.~〜ー]*$",
+    re.IGNORECASE,
+)
+
+
+def is_greeting_only(conversation_log: str) -> bool:
+    """会話が挨拶・相槌だけで、まだ作業の手がかりが無いか。
+
+    ここで打ち切らないと、モデルが「作業内容が不明です」という地の文を返し、
+    それを弾いた結果としてタイトルが付かない…という無駄な往復が毎回起きる。
+    さらに空振りでも中身の薄いタイトルが付くと REGEN_EVERY=0 で固定される。
+    """
+    lines = [line.strip() for line in conversation_log.splitlines() if line.strip()]
+    if not lines:
+        return True
+    return all(GREETING_RE.match(line) for line in lines)
+
+
 def generate_title(conversation_log: str, agent: str, max_width: int) -> str:
     """claude -p を最小構成で呼び、タイトル 1 行を得る。
 
@@ -492,6 +602,11 @@ def generate_title(conversation_log: str, agent: str, max_width: int) -> str:
     起動が速く、かつこの呼び出しが自分自身の hook を再入させない。
     """
     if not conversation_log.strip():
+        return ""
+    # 挨拶だけなら LLM を呼ばずに諦める。呼んでも拒否文が返るだけで、
+    # 課金と待ち時間が無駄になる
+    if is_greeting_only(conversation_log):
+        log("conversation is greetings only; no title yet")
         return ""
     command = [
         "claude",
@@ -650,7 +765,11 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     elif not may_overwrite_title(current_title, previous_title):
         log(f"title part {current_title!r} looks manual; leaving it alone")
     else:
-        conversation_log = read_prompts(hook_input.get("transcript_path"), MAX_LOG_CHARS)
+        conversation_log = read_prompts(
+            hook_input.get("transcript_path"),
+            MAX_LOG_CHARS,
+            hook_input.get("prompt") or "",
+        )
         generated = generate_title(conversation_log, detect_agent(hook_input), budget)
         if generated:
             title = generated

@@ -302,6 +302,63 @@ class TestReadPrompts(unittest.TestCase):
             )
             self.assertIn("ok", htm.read_prompts(str(path), 1500))
 
+    def test_skips_interrupt_markers(self):
+        """中断通知だけのログは空扱い。生成させるとメタ文がタイトルになる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                {"type": "user", "message": {"content": "[Request interrupted by user]"}},
+                {"type": "user", "message": {
+                    "content": "[Request interrupted by user for tool use]"}},
+            ])
+            self.assertEqual(htm.read_prompts(path, 1500), "")
+
+    def test_skips_skill_bodies(self):
+        """skill / slash command の本文はユーザーの意図ではない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                {"type": "user", "message": {
+                    "content": "Base directory for this skill: /x/y\n\n# Harness Plan\n手順"}},
+                {"type": "user", "message": {"content": "巨大" * 3000}},
+                {"type": "user", "message": {"content": "本題"}},
+            ])
+            out = htm.read_prompts(path, 1500)
+        self.assertEqual(out, "本題")
+
+    def test_appends_current_prompt_when_transcript_lacks_it(self):
+        """UserPromptSubmit 時点では最新プロンプトが transcript に無いことがある。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                {"type": "user", "message": {"content": "前の発言"}},
+            ])
+            out = htm.read_prompts(path, 1500, "サンプルのTODOスクリプトを作って")
+        self.assertIn("前の発言", out)
+        self.assertTrue(out.endswith("サンプルのTODOスクリプトを作って"))
+
+    def test_does_not_duplicate_current_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                {"type": "user", "message": {"content": "作って"}},
+            ])
+            self.assertEqual(htm.read_prompts(path, 1500, "作って"), "作って")
+
+    def test_current_prompt_survives_unreadable_transcript(self):
+        self.assertEqual(htm.read_prompts(None, 1500, "作って"), "作って")
+        self.assertEqual(htm.read_prompts("/nonexistent/t.jsonl", 1500, "作って"), "作って")
+
+    def test_current_prompt_noise_is_dropped(self):
+        self.assertEqual(htm.read_prompts(None, 1500, "[Request interrupted by user]"), "")
+
+    def test_keeps_newest_prompts_when_truncating(self):
+        """溢れたら古い方を捨てる。直近ほど今の作業を表す。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                {"type": "user", "message": {"content": "古い" * 400}},
+                {"type": "user", "message": {"content": "最新の依頼"}},
+            ])
+            out = htm.read_prompts(path, 100)
+        self.assertEqual(len(out), 100)
+        self.assertTrue(out.endswith("最新の依頼"))
+
 
 class TestMainGuards(unittest.TestCase):
     def _main_with(self, env, stdin='{"session_id":"s"}'):
