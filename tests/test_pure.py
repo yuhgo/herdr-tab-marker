@@ -3,8 +3,10 @@
 ソケットも LLM も要らない関数だけを対象にする。
 """
 
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -409,9 +411,11 @@ class TestResolveLang(unittest.TestCase):
     """
 
     def _resolve(self, raw, env=None, locale_name=""):
-        with mock.patch.dict(htm.os.environ, env or {}, clear=True):
-            with mock.patch.object(htm.locale, "getlocale", return_value=(locale_name, None)):
-                return htm._resolve_lang(raw)
+        with mock.patch.dict(htm.os.environ, env or {}, clear=True), \
+             mock.patch.object(
+                 htm.locale, "getlocale", return_value=(locale_name, None)
+             ):
+            return htm._resolve_lang(raw)
 
     def test_explicit_value_wins_over_locale(self):
         self.assertEqual(self._resolve("en", {"LANG": "ja_JP.UTF-8"}), "en")
@@ -437,9 +441,252 @@ class TestResolveLang(unittest.TestCase):
         self.assertEqual(self._resolve("xx", {}, locale_name=""), "ja")
 
     def test_broken_locale_does_not_raise(self):
-        with mock.patch.dict(htm.os.environ, {}, clear=True):
-            with mock.patch.object(htm.locale, "getlocale", side_effect=ValueError):
-                self.assertEqual(htm._resolve_lang("auto"), "ja")
+        with mock.patch.dict(htm.os.environ, {}, clear=True), \
+             mock.patch.object(htm.locale, "getlocale", side_effect=ValueError):
+            self.assertEqual(htm._resolve_lang("auto"), "ja")
+
+
+
+class TestTabStatePath(unittest.TestCase):
+    """所有権レコードはタブ単位。session_id 単位だと新セッションで失われる。"""
+
+    def test_path_is_under_tabs_dir(self):
+        path = htm.tab_state_path("w1:t4")
+        self.assertEqual(path.parent.name, "tabs")
+        self.assertEqual(path.parent.parent, htm.STATE_DIR)
+
+    def test_dir_follows_state_dir_at_call_time(self):
+        # 定数に畳むと、STATE_DIR を差し替えたテストが実 home に書き込んでしまう
+        with mock.patch.object(htm, "STATE_DIR", Path("/tmp/fake-state")):
+            self.assertEqual(
+                htm.tab_state_path("w1:t4").parent, Path("/tmp/fake-state/tabs")
+            )
+
+    def test_unsafe_characters_are_replaced(self):
+        # tab_id は `w1:t4` のようにコロンを含む。そのままではファイル名にできない
+        self.assertEqual(htm.tab_state_path("w1:t4").name, "w1_t4.json")
+
+    def test_slash_cannot_escape_the_directory(self):
+        path = htm.tab_state_path("../../etc/passwd")
+        self.assertEqual(path.parent.name, "tabs")
+        self.assertNotIn("..", path.name)
+
+    def test_empty_tab_id_falls_back(self):
+        self.assertEqual(htm.tab_state_path("").name, "unknown.json")
+        self.assertEqual(htm.tab_state_path(None).name, "unknown.json")
+
+    def test_safe_id_is_preserved(self):
+        self.assertEqual(htm.tab_state_path("w1t4").name, "w1t4.json")
+
+
+class TestOwnedTitle(unittest.TestCase):
+    """タブ所有権レコードから「自分が付けた名前」を取り出す。"""
+
+    def test_returns_recorded_title(self):
+        self.assertEqual(htm.owned_title({"title": "認証調査"}), "認証調査")
+
+    def test_missing_record_is_none(self):
+        self.assertIsNone(htm.owned_title({}))
+        self.assertIsNone(htm.owned_title(None))
+
+    def test_non_string_is_none(self):
+        # state が壊れていても落とさない
+        self.assertIsNone(htm.owned_title({"title": 5}))
+        self.assertIsNone(htm.owned_title({"title": None}))
+
+    def test_blank_is_none(self):
+        self.assertIsNone(htm.owned_title({"title": "   "}))
+
+
+class TestMayOverwriteAcrossSessions(unittest.TestCase):
+    """A の本丸: 別セッションでも自分の付けたタイトルは上書きできる。
+
+    従来は session_id 単位の state しか無く、新セッションでは
+    previous_title が None になって may_overwrite_title が必ず False を返した。
+    """
+
+    def test_own_title_from_another_session_is_overwritable(self):
+        # 新セッションなので session state は空。所有権はタブ側にある
+        tab_state = {"title": "認証調査"}
+        self.assertTrue(
+            htm.may_overwrite_title("認証調査", htm.owned_title(tab_state))
+        )
+
+    def test_manual_label_still_protected_with_tab_record(self):
+        # タブ側に別の名前が記録されていても、手動ラベルは守る
+        tab_state = {"title": "認証調査"}
+        self.assertFalse(htm.may_overwrite_title("ssh", htm.owned_title(tab_state)))
+
+    def test_manual_label_protected_with_no_record(self):
+        self.assertFalse(htm.may_overwrite_title("ssh", htm.owned_title({})))
+
+
+class TestGcTabStates(unittest.TestCase):
+    """所有権レコードの GC。放っておくとタブの数だけ増え続ける。"""
+
+    def _make(self, count, mtime_base=1_700_000_000):
+        d = Path(tempfile.mkdtemp()) / "tabs"
+        d.mkdir(parents=True)
+        for i in range(count):
+            f = d / f"w1_t{i}.json"
+            f.write_text('{"title": "x"}', encoding="utf-8")
+            # 若い番号ほど古い
+            os.utime(f, (mtime_base + i, mtime_base + i))
+        return d
+
+    def test_keeps_newest_up_to_limit(self):
+        d = self._make(10)
+        htm.gc_tab_states(d, keep=4)
+        remaining = sorted(p.name for p in d.glob("*.json"))
+        self.assertEqual(len(remaining), 4)
+        # 新しい方（番号が大きい方）が残る
+        self.assertEqual(remaining, ["w1_t6.json", "w1_t7.json", "w1_t8.json", "w1_t9.json"])
+
+    def test_under_limit_is_untouched(self):
+        d = self._make(3)
+        htm.gc_tab_states(d, keep=10)
+        self.assertEqual(len(list(d.glob("*.json"))), 3)
+
+    def test_missing_dir_is_safe(self):
+        htm.gc_tab_states(Path("/nonexistent/tabs"), keep=5)  # 例外を出さない
+
+    def test_only_touches_json(self):
+        d = self._make(6)
+        (d / "keep.txt").write_text("x", encoding="utf-8")
+        htm.gc_tab_states(d, keep=2)
+        self.assertTrue((d / "keep.txt").exists(), "json 以外を消してはいけない")
+
+
+class TestTokenizeForTopic(unittest.TestCase):
+    """話題比較用の語の切り出し。LLM を使わないのが B-2 の存在理由。"""
+
+    def test_ascii_words_are_lowercased(self):
+        self.assertIn("auth", htm.tokenize_for_topic("Auth まわりを調査"))
+
+    def test_japanese_runs_are_kept(self):
+        tokens = htm.tokenize_for_topic("認証まわりを調査する")
+        self.assertTrue(any("認証" in t for t in tokens))
+
+    def test_symbols_are_dropped(self):
+        self.assertEqual(htm.tokenize_for_topic("!!! ??? ---"), set())
+
+    def test_empty(self):
+        self.assertEqual(htm.tokenize_for_topic(""), set())
+        self.assertEqual(htm.tokenize_for_topic(None), set())
+
+    def test_short_ascii_noise_is_dropped(self):
+        # 1 文字の英字は話題を表さない
+        self.assertNotIn("a", htm.tokenize_for_topic("a b c auth"))
+
+
+class TestTopicChanged(unittest.TestCase):
+    """同話題なら生成しない / 別話題なら生成する。"""
+
+    def test_same_topic_is_not_changed(self):
+        self.assertFalse(
+            htm.topic_changed("認証まわりのテストを追加したい", "認証まわり調査")
+        )
+
+    def test_different_topic_is_changed(self):
+        self.assertTrue(
+            htm.topic_changed("課金の請求書PDFを直したい", "認証まわり調査")
+        )
+
+    def test_no_current_title_is_changed(self):
+        # タイトルが無ければ作るしかない
+        self.assertTrue(htm.topic_changed("何かの作業", ""))
+        self.assertTrue(htm.topic_changed("何かの作業", None))
+
+    def test_empty_prompt_is_not_changed(self):
+        # 判断材料が無いときは作り直さない（無駄な LLM 呼び出しを避ける）
+        self.assertFalse(htm.topic_changed("", "認証まわり調査"))
+
+    def test_ascii_same_topic(self):
+        self.assertFalse(htm.topic_changed("fix the auth token refresh", "auth token"))
+
+    def test_ascii_different_topic(self):
+        self.assertTrue(htm.topic_changed("update the billing invoice pdf", "auth token"))
+
+    def test_does_not_call_llm(self):
+        # 判定自体が有料になっては本末転倒
+        with mock.patch.object(htm, "generate_title") as gen:
+            htm.topic_changed("課金の請求書", "認証まわり調査")
+            gen.assert_not_called()
+
+
+class TestTopicChangedShortPrompts(unittest.TestCase):
+    """短い相づち・指示語で作り直さない。
+
+    語が数個しか無いプロンプトは「話題が変わった」根拠として弱い。
+    ここで生成に進むと、話題が続いているのに LLM を呼んでしまい
+    B-2 の目的（無駄な生成を減らす）と逆になる。
+    """
+
+    def test_thanks_does_not_regenerate(self):
+        self.assertFalse(htm.topic_changed("ありがとう", "認証まわり調査"))
+
+    def test_pronoun_only_does_not_regenerate(self):
+        self.assertFalse(htm.topic_changed("これも直して", "認証まわり調査"))
+
+    def test_ok_does_not_regenerate(self):
+        self.assertFalse(htm.topic_changed("ok", "auth token"))
+        self.assertFalse(htm.topic_changed("続けて", "認証まわり調査"))
+
+    def test_substantial_different_prompt_still_regenerates(self):
+        # 十分な語があれば従来どおり話題変化として扱う
+        self.assertTrue(
+            htm.topic_changed("課金の請求書PDFの出力を直したい", "認証まわり調査")
+        )
+
+
+class TestShouldRegenerate(unittest.TestCase):
+    """既定は話題変化モード。REGEN_EVERY 明示時のみ従来の N 回ごと。"""
+
+    def test_first_time_always_generates(self):
+        self.assertTrue(
+            htm.should_regenerate(
+                generated_at=0, prompt_count=1, regen_every=0,
+                recent_prompt="", current_title="",
+            )
+        )
+
+    def test_topic_mode_skips_same_topic(self):
+        self.assertFalse(
+            htm.should_regenerate(
+                generated_at=1, prompt_count=2, regen_every=0,
+                recent_prompt="認証まわりのテストを追加したい",
+                current_title="認証まわり調査",
+            )
+        )
+
+    def test_topic_mode_regenerates_on_new_topic(self):
+        self.assertTrue(
+            htm.should_regenerate(
+                generated_at=1, prompt_count=2, regen_every=0,
+                recent_prompt="課金の請求書PDFを直したい",
+                current_title="認証まわり調査",
+            )
+        )
+
+    def test_explicit_regen_every_keeps_counting(self):
+        # REGEN_EVERY=3 なら話題に関係なく 3 回ごと（後方互換）
+        same = {
+            "regen_every": 3,
+            "recent_prompt": "認証まわりのテスト",
+            "current_title": "認証まわり調査",
+        }
+        self.assertFalse(htm.should_regenerate(generated_at=1, prompt_count=3, **same))
+        self.assertTrue(htm.should_regenerate(generated_at=1, prompt_count=4, **same))
+
+    def test_explicit_regen_every_ignores_topic_change(self):
+        # 明示指定時は話題が変わっても間隔を守る（従来動作）
+        self.assertFalse(
+            htm.should_regenerate(
+                generated_at=1, prompt_count=2, regen_every=5,
+                recent_prompt="課金の請求書PDFを直したい",
+                current_title="認証まわり調査",
+            )
+        )
 
 
 if __name__ == "__main__":

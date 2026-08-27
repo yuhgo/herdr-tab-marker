@@ -646,12 +646,153 @@ def generate_title(conversation_log: str, agent: str, max_width: int) -> str:
     return sanitize_title(completed.stdout, max_width)
 
 
+# ---------------------------------------------------------------- 話題の変化
+
+# 助詞・助動詞など、話題を表さない 1〜2 文字語。bigram に混ざると
+# 無関係な文どうしが「似ている」と誤判定される
+STOP_BIGRAMS = frozenset(
+    {
+        "まわ", "わり", "した", "って", "てい", "でき", "ます", "です",
+        "ある", "いる", "する", "なる", "こと", "もの", "ため", "よう",
+    }
+)
+
+ASCII_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]+")
+CJK_RUN_RE = re.compile(r"[ぁ-んァ-ヶ一-龥ー]{2,}")
+
+# 語の重なりがこれ未満なら「話題が変わった」とみなす
+TOPIC_SIMILARITY_THRESHOLD = 0.20
+
+# 「話題が変わった」と言い切るのに要る最低限の中身の量（文字数）。
+# 「ありがとう」「これも直して」のような相づちは、いまの話題と語が重ならず
+# 重なり 0 になる。ここを通すと話題が続いているのに毎回生成してしまい、
+# B-2 の目的（無駄な生成を減らす）と逆になる。
+#
+# 語数ではなく文字数で測る。日本語は bigram に落とすため、短い相づちでも
+# 語数だけは増えてしまい（「ありがとう」→ 4 語）判断材料にならない。
+MIN_TOPIC_CHARS = 8
+
+
+def tokenize_for_topic(text: str | None) -> set:
+    """話題の比較に使う語を切り出す。
+
+    形態素解析器は使えない（標準ライブラリのみ）ので、日本語は文字 bigram に
+    落とす。厳密な語ではないが、「同じ話題か」を測るには十分な粒度になる。
+    """
+    if not text:
+        return set()
+    tokens = set()
+    # 英数字は語として拾う。1 文字は話題を表さないので落とす
+    for word in ASCII_WORD_RE.findall(text):
+        tokens.add(word.lower())
+    # 日本語は bigram に落とす
+    for run in CJK_RUN_RE.findall(text):
+        for i in range(len(run) - 1):
+            bigram = run[i : i + 2]
+            if bigram not in STOP_BIGRAMS:
+                tokens.add(bigram)
+    return tokens
+
+
+def topic_content(text: str | None) -> str:
+    """話題を表す部分だけを残す。記号や空白は量として数えない。"""
+    if not text:
+        return ""
+    return "".join(ASCII_WORD_RE.findall(text)) + "".join(CJK_RUN_RE.findall(text))
+
+
+def topic_changed(
+    recent_prompt: str | None,
+    current_title: str | None,
+    threshold: float = TOPIC_SIMILARITY_THRESHOLD,
+) -> bool:
+    """直近のプロンプトが、いまのタイトルと別の話題か。
+
+    **判定に LLM を使わない。** 判定自体が有料になっては本末転倒なので、
+    語の重なりだけで決める。
+
+    - タイトルが無い → 作るしかないので True
+    - プロンプトが空 → 判断材料が無い。無駄な生成を避けて False
+    """
+    if not current_title or not current_title.strip():
+        return True
+    # 短すぎるプロンプトは、話題変化の根拠として弱い。
+    # 相づちや指示語で作り直すと無駄な LLM 呼び出しになる
+    if len(topic_content(recent_prompt)) < MIN_TOPIC_CHARS:
+        return False
+    prompt_tokens = tokenize_for_topic(recent_prompt)
+    if not prompt_tokens:
+        return False
+    title_tokens = tokenize_for_topic(current_title)
+    if not title_tokens:
+        return True
+    overlap = prompt_tokens & title_tokens
+    # タイトルは短いので、タイトル側の語がどれだけ拾われたかで測る
+    similarity = len(overlap) / len(title_tokens)
+    return similarity < threshold
+
+
+def should_regenerate(
+    generated_at: int,
+    prompt_count: int,
+    regen_every: int,
+    recent_prompt: str | None,
+    current_title: str | None,
+) -> bool:
+    """いまタイトルを作り直すか。
+
+    - 初回（まだ一度も生成していない）: 必ず作る
+    - `REGEN_EVERY` 明示: 従来どおり N 回ごと。話題は見ない（後方互換）
+    - 既定（`REGEN_EVERY=0`）: 話題が変わった時だけ作る
+    """
+    if generated_at == 0:
+        return True
+    if regen_every > 0:
+        return prompt_count - generated_at >= regen_every
+    return topic_changed(recent_prompt, current_title)
+
+
 # ---------------------------------------------------------------- 状態
 
 
+def _safe_stem(raw: str | None) -> str:
+    """任意の識別子をファイル名として安全な語に落とす。
+
+    `..` や `/` を含む値でもディレクトリの外へ出られないようにする。
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw or "")
+    # 連続するドットは親ディレクトリ参照になりうるので 1 つに潰す
+    safe = re.sub(r"\.{2,}", ".", safe)
+    # ドットや区切り文字だけの名前も親ディレクトリを指してしまう
+    if not safe.strip("._-"):
+        return "unknown"
+    return safe
+
+
 def state_path(session_id: str | None) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id or "") or "unknown"
-    return STATE_DIR / f"{safe}.json"
+    return STATE_DIR / f"{_safe_stem(session_id)}.json"
+
+
+TAB_STATE_SUBDIR = "tabs"
+
+
+def tab_state_dir() -> Path:
+    """タブ所有権レコードの置き場所。
+
+    STATE_DIR から呼び出し時に組み立てる。定数に畳むとテストが
+    STATE_DIR を差し替えても実 home に書き込んでしまう。
+    """
+    return STATE_DIR / TAB_STATE_SUBDIR
+
+
+def tab_state_path(tab_id: str | None) -> Path:
+    """タブ単位の所有権レコードのパス。
+
+    session_id 単位で持つと、新しいセッションを起動した時点で
+    「前に自分が付けた名前」を手動ラベルと誤認し、二度と更新できなくなる。
+    タブに紐づけて持てば、セッションを跨いでも自分の名前だと分かる。
+    """
+    return tab_state_dir() / f"{_safe_stem(tab_id)}.json"
 
 
 def load_state(path: Path) -> dict:
@@ -669,6 +810,52 @@ def save_state(path: Path, state: dict) -> None:
         log(f"cannot save state: {exc}")
 
 
+MAX_TAB_STATES = _env_int("MAX_TAB_STATES", 64)
+
+
+def gc_tab_states(directory: Path, keep: int | None = None) -> None:
+    """古いタブ所有権レコードを間引く。
+
+    タブは開くたびに増えるので、放っておくとレコードが際限なく溜まる。
+    更新が新しいものを keep 件だけ残す。消しても実害はない（そのタブの
+    タイトルが一度だけ手動ラベル扱いになるだけ）ので、失敗しても黙って続ける。
+    """
+    # 既定値を引数に畳むと、後から MAX_TAB_STATES を変えても効かない
+    if keep is None:
+        keep = MAX_TAB_STATES
+    if keep < 0:
+        return
+    try:
+        records = list(directory.glob("*.json"))
+    except OSError as exc:
+        log(f"cannot list tab states: {exc}")
+        return
+    if len(records) <= keep:
+        return
+    try:
+        # 更新が新しい順に並べ、あふれた分を落とす。
+        # st_mtime（秒）だと同時刻の書き込みが並び順で決まってしまうので ns で見る
+        records.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    except OSError as exc:
+        log(f"cannot stat tab states: {exc}")
+        return
+    for stale in records[keep:]:
+        try:
+            stale.unlink()
+        except OSError as exc:
+            log(f"cannot remove {stale.name}: {exc}")
+
+
+def save_tab_state(path: Path, state: dict) -> None:
+    """タブ所有権レコードを保存する。置き場所（tabs/）は無ければ作る。"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log(f"cannot create tab state dir: {exc}")
+        return
+    save_state(path, state)
+
+
 AUTO_LABEL_RE = re.compile(r"^\d+$")
 
 
@@ -681,6 +868,19 @@ def is_disposable_title(stripped_label: str | None) -> bool:
     if not stripped_label or not stripped_label.strip():
         return True
     return bool(AUTO_LABEL_RE.match(stripped_label.strip()))
+
+
+def owned_title(tab_state: dict | None) -> str | None:
+    """タブ所有権レコードから「この hook が付けた名前」を取り出す。
+
+    state が壊れていても落とさない。読めなければ所有権なしとして扱う。
+    """
+    if not isinstance(tab_state, dict):
+        return None
+    title = tab_state.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+    return title
 
 
 def may_overwrite_title(stripped_label: str | None, previous_title: str | None) -> bool:
@@ -731,8 +931,6 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     """ロックを取った状態での本処理。"""
     state = load_state(path)
     prompt_count = int(state.get("prompt_count", 0)) + 1
-    generated_at = int(state.get("generated_at_prompt", 0))
-    previous_title = state.get("title")
     state["prompt_count"] = prompt_count
     save_state(path, state)
 
@@ -740,6 +938,15 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     if not tab_id:
         log("cannot resolve tab id; giving up")
         return
+
+    # 所有権はタブに紐づく。セッションを跨いでも自分の名前だと分かるようにする
+    tab_path = tab_state_path(tab_id)
+    tab_state = load_state(tab_path)
+    previous_title = owned_title(tab_state)
+    # 「いつ生成したか」はタイトルと同じ置き場所に持つ。session 側に残すと
+    # タイトルだけ復元できて generated_at が 0 に戻り、新セッションの初回で
+    # 話題が続いていても必ず生成してしまう
+    generated_at = int(tab_state.get("generated_at_prompt", 0) or 0)
 
     marker_map = parse_marker_map(os.environ.get("HERDR_TAB_MARKER_MAP"))
     repo = detect_repo(hook_input.get("cwd"))
@@ -749,15 +956,20 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     current_label = get_tab_label(tab_id)
     # 手動ラベル判定は絵文字を剥がしてから行う。
     # 前回付けた絵文字も剥がす対象に含める（MAP から値を消しても取り残さないため）
-    current_title = strip_marker(current_label, marker_map, state.get("marker"))
+    current_title = strip_marker(
+        current_label, marker_map, tab_state.get("marker") or state.get("marker")
+    )
 
     budget = title_budget(MAX_WIDTH, marker)
     # 既定ラベル（連番）は持ち回らない。残すと `🟦 5` のような残骸になる
     title = "" if is_disposable_title(current_title) else current_title
 
     # タイトルを作り直すか判断する。
-    # REGEN_EVERY=0 は「最初に付けたら以後変えない」。
-    due = generated_at == 0 or (REGEN_EVERY > 0 and prompt_count - generated_at >= REGEN_EVERY)
+    # 既定は話題が変わった時だけ。REGEN_EVERY 明示時は従来の N 回ごと
+    current_prompt = hook_input.get("prompt") or ""
+    due = should_regenerate(
+        generated_at, prompt_count, REGEN_EVERY, current_prompt, title
+    )
     if not TITLE_ENABLED:
         log("title generation disabled; marker only")
     elif not due:
@@ -773,8 +985,7 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         generated = generate_title(conversation_log, detect_agent(hook_input), budget)
         if generated:
             title = generated
-            state["title"] = generated
-            state["generated_at_prompt"] = prompt_count
+            tab_state["generated_at_prompt"] = prompt_count
         else:
             log("title generation produced nothing; keeping current title")
 
@@ -790,10 +1001,18 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         return
     if rename_tab(tab_id, new_label):
         state["tab_id"] = tab_id
-        # 次回この絵文字を剥がせるように覚えておく（MAP を変更されても取り残さない）
-        state["marker"] = marker
         state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         save_state(path, state)
+        # 所有権レコードはタブ側に残す。次のセッションがこれを見て
+        # 「自分が付けた名前」だと判断できる
+        if title:
+            tab_state["title"] = title
+        # 次回この絵文字を剥がせるように覚えておく（MAP を変更されても取り残さない）
+        tab_state["marker"] = marker
+        tab_state["updated_at"] = state["updated_at"]
+        save_tab_state(tab_path, tab_state)
+        # 保存した後に間引く。いま書いたレコードが最新なので必ず残る
+        gc_tab_states(tab_state_dir())
         log(f"renamed {current_label!r} -> {new_label!r}")
     else:
         log(f"rename to {new_label!r} failed")

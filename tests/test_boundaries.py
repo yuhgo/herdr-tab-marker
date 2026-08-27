@@ -528,14 +528,19 @@ class TestMarkerPersistence(unittest.TestCase):
         finally:
             fake.close()
 
-    def test_marker_is_recorded_in_state(self):
+    def test_marker_is_recorded_in_tab_state(self):
+        """絵文字の記録先はタブ所有権レコード。
+
+        セッション単位に置くと、新セッションで剥がせなくなり
+        `🔧 dotfiles` が手動ラベルと誤認される。
+        """
         state_dir = Path(tempfile.mkdtemp())
         home = tempfile.mkdtemp()
         repo = htm.detect_repo(os.getcwd())
         self._run_once(state_dir, "4", f'{{"{repo}":"🔧"}}', home)
-        state = htm.load_state(state_dir / "s1.json")
+        tab_state = htm.load_state(state_dir / "tabs" / "w1_t4.json")
         self.assertEqual(
-            state.get("marker"), "🔧", "使った絵文字が state に記録されていない"
+            tab_state.get("marker"), "🔧", "使った絵文字がタブ state に記録されていない"
         )
 
     def test_removed_map_value_is_still_stripped(self):
@@ -553,6 +558,195 @@ class TestMarkerPersistence(unittest.TestCase):
         self.assertTrue(new_label.endswith("手動の名前"), new_label)
         # 二重に絵文字が付いていない
         self.assertEqual(htm.display_width(new_label), 2 + 1 + htm.display_width("手動の名前"))
+
+
+class TestCrossSessionOwnership(unittest.TestCase):
+    """A の受け入れ条件: 別 session_id でも自分の付けたタイトルは上書きできる。
+
+    かつては session_id 単位の state しか無く、新セッションでは
+    previous_title が None になるため may_overwrite_title が必ず False を返し、
+    タブ名が二度と更新されなかった。
+    """
+
+    def _run(self, state_dir, home, session_id, current_label, generated, prompt=""):
+        fake = FakeHerdr({"result": {"tab": {"label": current_label}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": home,
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title", return_value=generated) as gen, \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                htm.run({
+                    "session_id": session_id,
+                    "cwd": os.getcwd(),
+                    "prompt": prompt,
+                })
+            return gen, rename
+        finally:
+            fake.close()
+
+    def test_second_session_can_update_its_own_title(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        # 1 回目: セッション s1 が「認証調査」を付ける
+        _, rename1 = self._run(
+            state_dir, home, "s1", "4", "認証調査", prompt="認証まわりを調べたい"
+        )
+        label1 = rename1.call_args[0][1]
+        self.assertTrue(label1.endswith("認証調査"), label1)
+
+        # 2 回目: 別セッション s2 が別の話題で来る。
+        # タブには前回のラベルが残っているが、自分が付けた名前なので上書きできる
+        gen2, rename2 = self._run(
+            state_dir, home, "s2", label1, "課金修正",
+            prompt="課金の請求書PDFの出力を直したい",
+        )
+        gen2.assert_called_once()  # 手動ラベル扱いされず生成まで進む
+        label2 = rename2.call_args[0][1]
+        self.assertTrue(label2.endswith("課金修正"), label2)
+
+    def test_manual_label_survives_a_new_session(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        # 1 回目でタブ所有権を作る
+        _, rename1 = self._run(state_dir, home, "s1", "4", "認証調査")
+        marker = rename1.call_args[0][1].split(" ", 1)[0]
+
+        # 2 回目: 人が手で `ssh` に付け替えた状態
+        gen2, rename2 = self._run(state_dir, home, "s2", f"{marker} ssh", "課金修正")
+        gen2.assert_not_called()  # 手動ラベルなので LLM を呼ばない
+        if rename2.called:
+            self.assertTrue(rename2.call_args[0][1].endswith("ssh"))
+
+    def test_ownership_record_lives_under_tabs_dir(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        self._run(state_dir, home, "s1", "4", "認証調査")
+        record = htm.load_state(state_dir / "tabs" / "w1_t4.json")
+        self.assertEqual(record.get("title"), "認証調査")
+
+
+class TestTabStateGcIsWired(unittest.TestCase):
+    """GC は run() から実際に呼ばれること。関数があるだけでは溜まり続ける。"""
+
+    def test_run_prunes_old_tab_records(self):
+        state_dir = Path(tempfile.mkdtemp())
+        tabs = state_dir / "tabs"
+        tabs.mkdir(parents=True)
+        # 上限を超える残骸を先に置く
+        for i in range(8):
+            stale = tabs / f"w9_t{i}.json"
+            stale.write_text('{"title": "古い"}', encoding="utf-8")
+            os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+        fake = FakeHerdr({"result": {"tab": {"label": "4"}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": tempfile.mkdtemp(),
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "MAX_TAB_STATES", 3), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title", return_value="認証調査"), \
+                 mock.patch.object(htm, "rename_tab", return_value=True):
+                htm.run({"session_id": "s1", "cwd": os.getcwd()})
+        finally:
+            fake.close()
+
+        remaining = sorted(p.name for p in tabs.glob("*.json"))
+        self.assertEqual(len(remaining), 3, remaining)
+        # いま書いたレコードは最新なので必ず残る
+        self.assertIn("w1_t4.json", remaining)
+
+
+class TestTopicRegenerationIsWired(unittest.TestCase):
+    """B-2 の受け入れ条件を run() 経由で確かめる。
+
+    同話題なら LLM を呼ばず、話題が変われば呼ぶ。
+    """
+
+    def _run(self, state_dir, home, session_id, current_label, prompt, regen_every=0):
+        fake = FakeHerdr({"result": {"tab": {"label": current_label}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": home,
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "REGEN_EVERY", regen_every), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title", return_value="課金請求書修正") as gen, \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                htm.run({
+                    "session_id": session_id,
+                    "cwd": os.getcwd(),
+                    "prompt": prompt,
+                })
+            return gen, rename
+        finally:
+            fake.close()
+
+    def _seed(self, state_dir, home):
+        """既に「認証まわり調査」が付いている状態を作る。"""
+        fake = FakeHerdr({"result": {"tab": {"label": "4"}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": home,
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title", return_value="認証まわり調査"), \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                htm.run({"session_id": "s1", "cwd": os.getcwd(), "prompt": "認証を調べたい"})
+            return rename.call_args[0][1]
+        finally:
+            fake.close()
+
+    def test_same_topic_does_not_call_llm(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        label = self._seed(state_dir, home)
+        gen, _ = self._run(
+            state_dir, home, "s1", label, "認証まわりのテストを追加したい"
+        )
+        gen.assert_not_called()
+
+    def test_new_topic_calls_llm(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        label = self._seed(state_dir, home)
+        gen, rename = self._run(
+            state_dir, home, "s1", label, "課金の請求書PDFを直したい"
+        )
+        gen.assert_called_once()
+        self.assertTrue(rename.call_args[0][1].endswith("課金請求書修正"))
+
+    def test_explicit_regen_every_ignores_topic(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        label = self._seed(state_dir, home)
+        # REGEN_EVERY=5 なら話題が変わっても間隔を守る（後方互換）
+        gen, _ = self._run(
+            state_dir, home, "s1", label, "課金の請求書PDFを直したい", regen_every=5
+        )
+        gen.assert_not_called()
 
 
 class TestDaemonizeFailure(unittest.TestCase):
@@ -586,3 +780,57 @@ class TestDaemonizeFailure(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGeneratedAtIsTabScoped(unittest.TestCase):
+    """「いつ生成したか」はタイトルと同じ置き場所（タブ側）に持つ。
+
+    session 側に残すと、タイトルはタブ所有権レコードから復元できるのに
+    generated_at だけが 0 に戻り、新セッションの初回で必ず「初回だから生成」
+    と判断されてしまう。話題が続いていても LLM を呼ぶことになり、
+    B-2（無駄な生成を減らす）が新セッションで効かない。
+    """
+
+    def _run(self, state_dir, home, session_id, label, prompt):
+        fake = FakeHerdr({"result": {"tab": {"label": label}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": home,
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "REGEN_EVERY", 0), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title",
+                                   return_value="課金請求書修正") as gen, \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                htm.run({"session_id": session_id, "cwd": os.getcwd(), "prompt": prompt})
+            return gen, rename
+        finally:
+            fake.close()
+
+    def test_new_session_same_topic_does_not_regenerate(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        # セッション A がタイトルを付ける
+        _, rename = self._run(state_dir, home, "s1", "4", "課金の請求書を直したい")
+        label = rename.call_args[0][1]
+
+        # 別セッション B が同じ話題で来る。生成し直す理由がない
+        gen, _ = self._run(
+            state_dir, home, "s2", label, "課金の請求書の消費税計算も直したい"
+        )
+        gen.assert_not_called()
+
+    def test_new_session_new_topic_still_regenerates(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        _, rename = self._run(state_dir, home, "s1", "4", "課金の請求書を直したい")
+        label = rename.call_args[0][1]
+        gen, _ = self._run(
+            state_dir, home, "s2", label, "認証まわりのトークン期限を調べたい"
+        )
+        gen.assert_called_once()
