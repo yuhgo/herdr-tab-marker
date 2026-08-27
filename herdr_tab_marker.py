@@ -833,8 +833,9 @@ def gc_tab_states(directory: Path, keep: int | None = None) -> None:
     if len(records) <= keep:
         return
     try:
-        # 更新が新しい順に並べ、あふれた分を落とす
-        records.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        # 更新が新しい順に並べ、あふれた分を落とす。
+        # st_mtime（秒）だと同時刻の書き込みが並び順で決まってしまうので ns で見る
+        records.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
     except OSError as exc:
         log(f"cannot stat tab states: {exc}")
         return
@@ -930,7 +931,6 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     """ロックを取った状態での本処理。"""
     state = load_state(path)
     prompt_count = int(state.get("prompt_count", 0)) + 1
-    generated_at = int(state.get("generated_at_prompt", 0))
     state["prompt_count"] = prompt_count
     save_state(path, state)
 
@@ -943,6 +943,10 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     tab_path = tab_state_path(tab_id)
     tab_state = load_state(tab_path)
     previous_title = owned_title(tab_state)
+    # 「いつ生成したか」はタイトルと同じ置き場所に持つ。session 側に残すと
+    # タイトルだけ復元できて generated_at が 0 に戻り、新セッションの初回で
+    # 話題が続いていても必ず生成してしまう
+    generated_at = int(tab_state.get("generated_at_prompt", 0) or 0)
 
     marker_map = parse_marker_map(os.environ.get("HERDR_TAB_MARKER_MAP"))
     repo = detect_repo(hook_input.get("cwd"))
@@ -981,7 +985,7 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         generated = generate_title(conversation_log, detect_agent(hook_input), budget)
         if generated:
             title = generated
-            state["generated_at_prompt"] = prompt_count
+            tab_state["generated_at_prompt"] = prompt_count
         else:
             log("title generation produced nothing; keeping current title")
 

@@ -568,7 +568,7 @@ class TestCrossSessionOwnership(unittest.TestCase):
     タブ名が二度と更新されなかった。
     """
 
-    def _run(self, state_dir, home, session_id, current_label, generated):
+    def _run(self, state_dir, home, session_id, current_label, generated, prompt=""):
         fake = FakeHerdr({"result": {"tab": {"label": current_label}}})
         try:
             env = {
@@ -582,7 +582,11 @@ class TestCrossSessionOwnership(unittest.TestCase):
                  mock.patch.object(htm, "read_prompts", return_value="ログ"), \
                  mock.patch.object(htm, "generate_title", return_value=generated) as gen, \
                  mock.patch.object(htm, "rename_tab", return_value=True) as rename:
-                htm.run({"session_id": session_id, "cwd": os.getcwd()})
+                htm.run({
+                    "session_id": session_id,
+                    "cwd": os.getcwd(),
+                    "prompt": prompt,
+                })
             return gen, rename
         finally:
             fake.close()
@@ -591,12 +595,18 @@ class TestCrossSessionOwnership(unittest.TestCase):
         state_dir = Path(tempfile.mkdtemp())
         home = tempfile.mkdtemp()
         # 1 回目: セッション s1 が「認証調査」を付ける
-        _, rename1 = self._run(state_dir, home, "s1", "4", "認証調査")
+        _, rename1 = self._run(
+            state_dir, home, "s1", "4", "認証調査", prompt="認証まわりを調べたい"
+        )
         label1 = rename1.call_args[0][1]
         self.assertTrue(label1.endswith("認証調査"), label1)
 
-        # 2 回目: 別セッション s2。タブには前回のラベルが残っている
-        gen2, rename2 = self._run(state_dir, home, "s2", label1, "課金修正")
+        # 2 回目: 別セッション s2 が別の話題で来る。
+        # タブには前回のラベルが残っているが、自分が付けた名前なので上書きできる
+        gen2, rename2 = self._run(
+            state_dir, home, "s2", label1, "課金修正",
+            prompt="課金の請求書PDFの出力を直したい",
+        )
         gen2.assert_called_once()  # 手動ラベル扱いされず生成まで進む
         label2 = rename2.call_args[0][1]
         self.assertTrue(label2.endswith("課金修正"), label2)
@@ -770,3 +780,57 @@ class TestDaemonizeFailure(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGeneratedAtIsTabScoped(unittest.TestCase):
+    """「いつ生成したか」はタイトルと同じ置き場所（タブ側）に持つ。
+
+    session 側に残すと、タイトルはタブ所有権レコードから復元できるのに
+    generated_at だけが 0 に戻り、新セッションの初回で必ず「初回だから生成」
+    と判断されてしまう。話題が続いていても LLM を呼ぶことになり、
+    B-2（無駄な生成を減らす）が新セッションで効かない。
+    """
+
+    def _run(self, state_dir, home, session_id, label, prompt):
+        fake = FakeHerdr({"result": {"tab": {"label": label}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": home,
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "REGEN_EVERY", 0), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title",
+                                   return_value="課金請求書修正") as gen, \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                htm.run({"session_id": session_id, "cwd": os.getcwd(), "prompt": prompt})
+            return gen, rename
+        finally:
+            fake.close()
+
+    def test_new_session_same_topic_does_not_regenerate(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        # セッション A がタイトルを付ける
+        _, rename = self._run(state_dir, home, "s1", "4", "課金の請求書を直したい")
+        label = rename.call_args[0][1]
+
+        # 別セッション B が同じ話題で来る。生成し直す理由がない
+        gen, _ = self._run(
+            state_dir, home, "s2", label, "課金の請求書の消費税計算も直したい"
+        )
+        gen.assert_not_called()
+
+    def test_new_session_new_topic_still_regenerates(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        _, rename = self._run(state_dir, home, "s1", "4", "課金の請求書を直したい")
+        label = rename.call_args[0][1]
+        gen, _ = self._run(
+            state_dir, home, "s2", label, "認証まわりのトークン期限を調べたい"
+        )
+        gen.assert_called_once()

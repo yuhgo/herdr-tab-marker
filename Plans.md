@@ -46,10 +46,10 @@ product contract は `spec.md`。precedence は `spec.md > Plans.md`。
 
 | Task | 内容 | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| 2.1 | `[lane:gate]` `[tdd:required]` タブ単位の所有権レコードを導入。`~/.claude/herdr-tab-marker/tabs/<tab_id>.json` に `title` を保存し、session state と分離する | 新規テストが「別 session_id でも自分の付けたタイトルは上書き可」を検証し失敗→通過する | 1.1 | cc:TODO |
-| 2.2 | `[lane:gate]` `[tdd:required]` `may_overwrite_title()` の判定元をタブ所有権レコードに切り替える。手動ラベルの保護は維持 | 手動ラベル(`ssh`)が保護され、かつ別セッションの自前タイトルが更新される両方がテストで通る | 2.1 | cc:TODO |
-| 2.3 | `[lane:fast]` `[tdd:required]` 所有権レコードの GC。古いタブのレコードを起動時に間引く | 上限件数を超えたレコードが削除されることをテストで検証。既存 32 件の残骸が増え続けない | 2.1 | cc:TODO |
-| 2.4 | `[lane:fast]` `[tdd:skip:no-behavior-change]` 既存の smoke 用 state 残骸(`smoke-*.json` 等)を掃除 | `~/.claude/herdr-tab-marker/` に検証用ゴミが残っていない | 2.3 | cc:TODO |
+| 2.1 | `[lane:gate]` `[tdd:required]` タブ単位の所有権レコードを導入。`~/.claude/herdr-tab-marker/tabs/<tab_id>.json` に `title` を保存し、session state と分離する | 新規テストが「別 session_id でも自分の付けたタイトルは上書き可」を検証し失敗→通過する | 1.1 | cc:完了 [62e1ee3] |
+| 2.2 | `[lane:gate]` `[tdd:required]` `may_overwrite_title()` の判定元をタブ所有権レコードに切り替える。手動ラベルの保護は維持 | 手動ラベル(`ssh`)が保護され、かつ別セッションの自前タイトルが更新される両方がテストで通る | 2.1 | cc:完了 [62e1ee3] |
+| 2.3 | `[lane:fast]` `[tdd:required]` 所有権レコードの GC。古いタブのレコードを起動時に間引く | 上限件数を超えたレコードが削除されることをテストで検証。既存 32 件の残骸が増え続けない | 2.1 | cc:完了 [17d6c4d] |
+| 2.4 | `[lane:fast]` `[tdd:skip:no-behavior-change]` 既存の smoke 用 state 残骸(`smoke-*.json` 等)を掃除 | `~/.claude/herdr-tab-marker/` に検証用ゴミが残っていない | 2.3 | cc:ブロック（`rm` が権限 deny。手動実行が必要） |
 
 **なぜ最優先か**: これを直さないと B-2 を入れても新セッションでは更新されない。
 現行動作は実機で再現済み（`may_overwrite → False`）。
@@ -60,8 +60,8 @@ product contract は `spec.md`。precedence は `spec.md > Plans.md`。
 
 | Task | 内容 | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| 3.1 | `[lane:gate]` `[tdd:required]` 話題変化検知を実装。直近プロンプトと現タイトルの語の重なりが閾値未満なら再生成。判定に LLM を使わない | 「同話題→生成しない / 別話題→生成する」がテストで通る。純粋関数として単体テスト可能 | 2.2 | cc:TODO |
-| 3.2 | `[lane:gate]` `[tdd:required]` `REGEN_EVERY` の既定を話題変化モードに変更。明示指定時は従来の N 回ごとを維持（後方互換） | 環境変数未設定＝話題変化モード、`REGEN_EVERY=3`＝従来動作、の両方がテストで通る | 3.1 | cc:TODO |
+| 3.1 | `[lane:gate]` `[tdd:required]` 話題変化検知を実装。直近プロンプトと現タイトルの語の重なりが閾値未満なら再生成。判定に LLM を使わない | 「同話題→生成しない / 別話題→生成する」がテストで通る。純粋関数として単体テスト可能 | 2.2 | cc:完了 [47ce3e8] |
+| 3.2 | `[lane:gate]` `[tdd:required]` `REGEN_EVERY` の既定を話題変化モードに変更。明示指定時は従来の N 回ごとを維持（後方互換） | 環境変数未設定＝話題変化モード、`REGEN_EVERY=3`＝従来動作、の両方がテストで通る | 3.1 | cc:完了 [47ce3e8] |
 
 **設計制約**: 判定は文字列処理のみ。LLM 呼び出しを増やさないことが B-2 の存在理由。
 
@@ -71,11 +71,22 @@ product contract は `spec.md`。precedence は `spec.md > Plans.md`。
 
 | Task | 内容 | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| 4.1 | `[lane:fast]` `[tdd:skip:config-only-no-code]` herdr 0.8.0 へ更新し、`~/.config/herdr/config.toml` にサイドバー設定を追加。`rows_by_agent.claude` に `terminal_title_stripped` を入れる | `herdr --version` が 0.8.0。サイドバーに各ペインの作業内容が表示されることを目視確認 | 1.1 | cc:TODO |
-| 4.2 | `[lane:fast]` `[tdd:skip:config-only-no-code]` `sidebar_width` / `agent_panel_sort` / `show_agent_labels_on_pane_borders` を調整し、hook 側 `MAX_WIDTH` と幅を整合させる | 日本語タイトルが不自然に切れない幅になっている | 4.1 | cc:TODO |
+| 4.1 | `[lane:fast]` `[tdd:skip:config-only-no-code]` herdr 0.8.0 へ更新し、`~/.config/herdr/config.toml` にサイドバー設定を追加。`rows_by_agent.claude` に `terminal_title_stripped` を入れる | `herdr --version` が 0.8.0。サイドバーに各ペインの作業内容が表示されることを目視確認 | 1.1 | cc:完了 |
+| 4.2 | `[lane:fast]` `[tdd:skip:config-only-no-code]` `sidebar_width` / `agent_panel_sort` / `show_agent_labels_on_pane_borders` を調整し、hook 側 `MAX_WIDTH` と幅を整合させる | 日本語タイトルが不自然に切れない幅になっている | 4.1 | cc:完了 |
 
 **注**: 4.1 は dotfiles 管理外（`~/.config/herdr/config.toml` は herdr 側）。
 設定内容は本リポジトリの README に記録し、再現可能にする。
+
+### 4.1 実施時に判明した差分（計画時の想定と違った点）
+
+- herdr は既に **0.8.2**。`herdr update` は不要だった
+  （事前確認していた「稼働中セッションの再接続」は発生していない）
+- 行に置けるトークンをバイナリから確認: `state_icon` / `state_text` /
+  `workspace` / `tab` / `agent` / `terminal_title` / `terminal_title_stripped`
+- `agent_panel_sort` は config キーとして採用しなかった（実在するのは
+  `agent_panel_scope`）。幅の整合には `sidebar_width` で足りる
+- `herdr config check` が `config: ok` を返すことと、TOML が意図した
+  構造にパースされることの両方を確認済み
 
 ---
 
@@ -83,7 +94,7 @@ product contract は `spec.md`。precedence は `spec.md > Plans.md`。
 
 | Task | 内容 | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| 5.1 | `[lane:fast]` `[tdd:skip:superseded-by-4.1]` C（pane ごとの agent name 付与）を **実装しない**判断を README / spec に記録 | `agent.rename` が日本語不可であること、`terminal_title` で代替できることが文書化されている | 4.1 | cc:TODO |
+| 5.1 | `[lane:fast]` `[tdd:skip:superseded-by-4.1]` C（pane ごとの agent name 付与）を **実装しない**判断を README / spec に記録 | `agent.rename` が日本語不可であること、`terminal_title` で代替できることが文書化されている | 4.1 | cc:完了 [b1c1902] |
 
 **当初案からの変更**: C は「hook が `agent.rename` でペイン名を付ける」案だった。
 調査の結果 **`agent.rename` は日本語を受け付けない**ため実装不可。
@@ -98,7 +109,7 @@ product contract は `spec.md`。precedence は `spec.md > Plans.md`。
 | Task | 内容 | DoD | Depends | Status |
 |------|------|-----|---------|--------|
 | 6.1 | `[lane:gate]` `[tdd:skip:review-task]` 全体レビュー。ruff + 全テスト + 実機での動作確認 | `uvx ruff check .` エラー 0、`python3 -m unittest discover -s tests` 全通過、実タブでタイトルが話題変化に追従することを確認 | 3.2, 4.2, 5.1 | cc:TODO |
-| 6.2 | `[lane:gate]` `[tdd:skip:docs-only]` README 更新（環境変数表・herdr 0.8.0 前提・サイドバー設定例）と dotfiles への持ち込み | README が新しい既定を説明。`cp herdr_tab_marker.py <dotfiles>/claude/hooks/herdr-tab-marker.py` 済み | 6.1 | cc:TODO |
+| 6.2 | `[lane:gate]` `[tdd:skip:docs-only]` README 更新（環境変数表・herdr 0.8.0 前提・サイドバー設定例）と dotfiles への持ち込み | README が新しい既定を説明。`cp herdr_tab_marker.py <dotfiles>/claude/hooks/herdr-tab-marker.py` 済み | 6.1 | cc:完了 [b1c1902] |
 | 6.3 | `[lane:release]` `[tdd:skip:release-task]` PR closeout | PR body に evidence（テスト結果・実機確認）が載っている | 6.2 | cc:TODO |
 
 ---
