@@ -108,11 +108,44 @@ product contract は `spec.md`。precedence は `spec.md > Plans.md`。
 
 | Task | 内容 | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| 6.1 | `[lane:gate]` `[tdd:skip:review-task]` 全体レビュー。ruff + 全テスト + 実機での動作確認 | `uvx ruff check .` エラー 0、`python3 -m unittest discover -s tests` 全通過、実タブでタイトルが話題変化に追従することを確認 | 3.2, 4.2, 5.1 | cc:TODO |
-| 6.2 | `[lane:gate]` `[tdd:skip:docs-only]` README 更新（環境変数表・herdr 0.8.0 前提・サイドバー設定例）と dotfiles への持ち込み | README が新しい既定を説明。`cp herdr_tab_marker.py <dotfiles>/claude/hooks/herdr-tab-marker.py` 済み | 6.1 | cc:完了 [b1c1902] |
+| 6.1 | `[lane:gate]` `[tdd:skip:review-task]` 全体レビュー。ruff + 全テスト + 実機での動作確認 | `uvx ruff check .` エラー 0、`python3 -m unittest discover -s tests` 全通過、実タブでタイトルが話題変化に追従することを確認 | 3.2, 4.2, 5.1 | cc:完了 [db23e4c] |
+| 6.2 | `[lane:gate]` `[tdd:skip:docs-only]` README 更新（環境変数表・herdr 0.8.0 前提・サイドバー設定例）と dotfiles への持ち込み | README が新しい既定を説明。`cp herdr_tab_marker.py <dotfiles>/claude/hooks/herdr-tab-marker.py` 済み | 6.1 | cc:完了 [b1c1902 / dotfiles 7d9e2bf] |
 | 6.3 | `[lane:release]` `[tdd:skip:release-task]` PR closeout | PR body に evidence（テスト結果・実機確認）が載っている | 6.2 | cc:TODO |
 
 ---
+
+## 6.1 レビュー結果
+
+独立レビュー（fresh context / static）: **APPROVE**。critical / major の指摘なし。
+minor 2 件はどちらも対応済み。
+
+| 指摘 | 対応 |
+|------|------|
+| `gc_tab_states` が `st_mtime`（秒）で並べるため同時刻が並び順で決まる | `st_mtime_ns` に変更 |
+| `topic_changed` の比較対象が現タイトルのみで、語彙が入れ替わると余分に再生成 | 限界として spec.md §2.3 に明記 |
+
+### 実機検証（herdr 0.8.2）で見つけた不具合
+
+静的レビューでは APPROVE だったが、実機の通し検証で 1 件見つけて直した。
+
+- **生成時点（`generated_at_prompt`）が session 単位のままだった。**
+  タイトルはタブ所有権レコードから復元できるのに生成時点だけ 0 に戻り、
+  新セッションの初回で必ず「初回だから生成」と判断されていた。
+  話題が続いていても LLM を呼ぶため、B-2 が新セッションで効かない状態。
+  単体テストは同一セッション内しか見ておらず素通りしていた。
+  再現テストを追加してから修正（`4f41c75`）。
+
+実機で確認した振る舞い:
+
+| ケース | 期待 | 結果 |
+|--------|------|------|
+| セッション A 初回 | 生成する | ✅ |
+| 別セッション B・同話題 | 呼ばない | ✅ |
+| 別セッション C・別話題 | 呼ぶ | ✅ |
+| 別セッションが自分の付けた名前を上書き | できる | ✅ `🐳 認証まわり調査` → `🐳 課金請求書修正` |
+| 手動ラベル `ssh` の保護 | 上書きしない | ✅ LLM も呼ばない |
+
+検証用に作ったタブ（`w1:tN`）は close 済み。
 
 ## Spec delta
 
