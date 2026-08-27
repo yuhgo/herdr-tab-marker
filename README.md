@@ -33,6 +33,7 @@ RPC は 72 メソッドあるが `tab.*` は `create` / `list` / `get` / `focus`
 |------|------|--------|
 | リポジトリ識別 | リポジトリごとに固有の絵文字を先頭に付ける | ゼロ（cwd から決まる） |
 | タイトル自動設定 | 会話ログから短いタイトルを生成 | LLM 呼び出しあり |
+| 話題変化での更新 | 話題が変わった時だけタイトルを作り直す | 判定はゼロ（文字列処理のみ） |
 
 `HERDR_TAB_MARKER_TITLE=0` にすると絵文字だけになり、LLM を一切呼ばない。
 
@@ -47,6 +48,32 @@ RPC は 72 メソッドあるが `tab.*` は `create` / `list` / `get` / `focus`
 
 そのため `ssh` と手で名付けたタブは `🐳 ssh` になる。
 意図的な命名を守りつつ、リポジトリ識別だけは効く。
+
+所有権の記録は**タブ単位**で持つ（`~/.claude/herdr-tab-marker/tabs/<tab_id>.json`）。
+セッション単位で持つと、新しいセッションを起動した時点で
+「前に自分が付けた名前」を手動ラベルと誤認し、二度と更新できなくなる。
+
+### いつ作り直すか
+
+既定では**話題が変わった時だけ**作り直す。
+
+| 状況 | 挙動 |
+|------|------|
+| 初回 | 生成する |
+| 話題が継続 | 生成しない（LLM を呼ばない） |
+| 話題が変わった | 生成し直す |
+| 手動ラベル | 生成しない（LLM を呼ばない） |
+
+話題の判定に**LLM は使わない**。判定自体が有料になっては本末転倒なので、
+直近プロンプトと現タイトルの語の重なりだけで決める。
+日本語は形態素解析器が使えないため文字 bigram に落としている。
+
+相づちや指示語（「ありがとう」「これも直して」）では作り直さない。
+語が少なすぎるプロンプトは話題変化の根拠として弱く、
+ここで生成すると話題が続いているのに毎回 LLM を呼んでしまうため。
+
+`HERDR_TAB_MARKER_REGEN_EVERY` を明示すると、話題に関係なく
+N 回ごとに作り直す従来動作に戻る（後方互換）。
 
 ### 絵文字の決まり方
 
@@ -102,7 +129,8 @@ herdr の外で起動された場合は何もせずに終了する。
 | `HERDR_TAB_MARKER_TITLE` | `1` | タイトルを生成するか（`0` で LLM を一切呼ばない） |
 | `HERDR_TAB_MARKER_LANG` | `auto` | `ja` / `en` / `auto`（ロケール追従） |
 | `HERDR_TAB_MARKER_MAX_WIDTH` | `28` | タブ名の表示幅（半角 1 / 全角 2 カラム） |
-| `HERDR_TAB_MARKER_REGEN_EVERY` | `0` | タイトル再生成の間隔（`0` = 最初に付けたら以後変えない） |
+| `HERDR_TAB_MARKER_REGEN_EVERY` | `0` | タイトル再生成の間隔（`0` = 話題が変わった時だけ / `N` = N 回ごと） |
+| `HERDR_TAB_MARKER_MAX_TAB_STATES` | `64` | 所有権レコードの保持件数（超えた分は古い順に間引く） |
 | `HERDR_TAB_MARKER_MODEL` | `haiku` | タイトル生成モデル |
 | `HERDR_TAB_MARKER_MAX_BUDGET_USD` | `0.05` | 1 回あたりのコスト上限 |
 | `HERDR_TAB_MARKER_TIMEOUT_SEC` | `90` | タイトル生成のタイムアウト |
@@ -110,6 +138,53 @@ herdr の外で起動された場合は何もせずに終了する。
 | `HERDR_TAB_MARKER_DEBUG` | `0` | `~/.claude/herdr-tab-marker/debug.log` に出力 |
 | `HERDR_TAB_MARKER_FOREGROUND` | `0` | daemonize せず前景で実行（デバッグ用） |
 | `HERDR_TAB_MARKER_DISABLE` | `0` | 一時的に無効化 |
+
+## サイドバーで複数の Claude を見分ける
+
+1 つのタブに Claude を複数並べると、タブ名だけでは各ペインの作業が分からない。
+これは **herdr 側の設定だけで解決する**（この hook の実装は要らない）。
+
+Claude Code は自身の作業内容をターミナルタイトルに書いており、
+herdr はそれを `terminal_title_stripped` として**ペインごとに**保持している。
+行構成を指定すれば、そのまま読める。
+
+`~/.config/herdr/config.toml`:
+
+```toml
+[ui]
+sidebar_width = 32                        # 既定 26 だと日本語が切れる
+show_agent_labels_on_pane_borders = true
+
+[ui.sidebar.agents]
+row_gap = 0
+
+[ui.sidebar.agents.rows_by_agent]
+claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent"]]
+```
+
+反映を確かめる:
+
+```sh
+herdr config check   # => config: ok
+```
+
+行に置けるトークンは `state_icon` / `state_text` / `workspace` / `tab` /
+`agent` / `terminal_title` / `terminal_title_stripped`。
+herdr 0.8 系で確認している。
+
+`sidebar_width` は hook 側の `HERDR_TAB_MARKER_MAX_WIDTH`（既定 28）と揃える。
+既定の 26 のままだと日本語タイトルが不自然に切れる。
+
+### ペイン名を付けない理由
+
+「hook が `agent.rename` でペインに日本語名を付ける」案は**採らなかった**。
+
+herdr の agent 名は `[a-z][a-z0-9_-]{0,31}` に制限されており、
+**日本語を受け付けない**（実機で `invalid_agent_name` を確認）。
+
+一方 `terminal_title` は既にペインごとに存在し、常に最新に保たれている。
+上記の設定だけで目的（複数 Claude の識別）が達成できるので、
+コードを増やす理由がない。
 
 ## デバッグ
 
@@ -131,13 +206,14 @@ cat ~/.claude/herdr-tab-marker/debug.log
 ## 開発
 
 ```sh
-python3 -m unittest discover -s tests   # 114 tests
+python3 -m unittest discover -s tests   # 193 tests
 uvx ruff check .
 ```
 
 `herdr_tab_marker.py` は単一ファイル・Python 3 標準ライブラリのみで完結している。
 純粋関数（`marker_for` / `strip_marker` / `truncate` / `sanitize_title` / `detect_repo` /
-`may_overwrite_title`）はソケットも LLM も要らないので単体でテストできる。
+`may_overwrite_title` / `topic_changed` / `should_regenerate`）は
+ソケットも LLM も要らないので単体でテストできる。
 
 ## 謝辞
 

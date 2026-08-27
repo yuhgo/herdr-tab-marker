@@ -411,9 +411,11 @@ class TestResolveLang(unittest.TestCase):
     """
 
     def _resolve(self, raw, env=None, locale_name=""):
-        with mock.patch.dict(htm.os.environ, env or {}, clear=True):
-            with mock.patch.object(htm.locale, "getlocale", return_value=(locale_name, None)):
-                return htm._resolve_lang(raw)
+        with mock.patch.dict(htm.os.environ, env or {}, clear=True), \
+             mock.patch.object(
+                 htm.locale, "getlocale", return_value=(locale_name, None)
+             ):
+            return htm._resolve_lang(raw)
 
     def test_explicit_value_wins_over_locale(self):
         self.assertEqual(self._resolve("en", {"LANG": "ja_JP.UTF-8"}), "en")
@@ -439,13 +441,10 @@ class TestResolveLang(unittest.TestCase):
         self.assertEqual(self._resolve("xx", {}, locale_name=""), "ja")
 
     def test_broken_locale_does_not_raise(self):
-        with mock.patch.dict(htm.os.environ, {}, clear=True):
-            with mock.patch.object(htm.locale, "getlocale", side_effect=ValueError):
-                self.assertEqual(htm._resolve_lang("auto"), "ja")
+        with mock.patch.dict(htm.os.environ, {}, clear=True), \
+             mock.patch.object(htm.locale, "getlocale", side_effect=ValueError):
+            self.assertEqual(htm._resolve_lang("auto"), "ja")
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestTabStatePath(unittest.TestCase):
@@ -671,8 +670,11 @@ class TestShouldRegenerate(unittest.TestCase):
 
     def test_explicit_regen_every_keeps_counting(self):
         # REGEN_EVERY=3 なら話題に関係なく 3 回ごと（後方互換）
-        same = dict(regen_every=3, recent_prompt="認証まわりのテスト",
-                    current_title="認証まわり調査")
+        same = {
+            "regen_every": 3,
+            "recent_prompt": "認証まわりのテスト",
+            "current_title": "認証まわり調査",
+        }
         self.assertFalse(htm.should_regenerate(generated_at=1, prompt_count=3, **same))
         self.assertTrue(htm.should_regenerate(generated_at=1, prompt_count=4, **same))
 
@@ -685,3 +687,7 @@ class TestShouldRegenerate(unittest.TestCase):
                 current_title="認証まわり調査",
             )
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
