@@ -444,3 +444,77 @@ class TestResolveLang(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTabStatePath(unittest.TestCase):
+    """所有権レコードはタブ単位。session_id 単位だと新セッションで失われる。"""
+
+    def test_path_is_under_tabs_dir(self):
+        path = htm.tab_state_path("w1:t4")
+        self.assertEqual(path.parent.name, "tabs")
+        self.assertEqual(path.parent.parent, htm.STATE_DIR)
+
+    def test_dir_follows_state_dir_at_call_time(self):
+        # 定数に畳むと、STATE_DIR を差し替えたテストが実 home に書き込んでしまう
+        with mock.patch.object(htm, "STATE_DIR", Path("/tmp/fake-state")):
+            self.assertEqual(
+                htm.tab_state_path("w1:t4").parent, Path("/tmp/fake-state/tabs")
+            )
+
+    def test_unsafe_characters_are_replaced(self):
+        # tab_id は `w1:t4` のようにコロンを含む。そのままではファイル名にできない
+        self.assertEqual(htm.tab_state_path("w1:t4").name, "w1_t4.json")
+
+    def test_slash_cannot_escape_the_directory(self):
+        path = htm.tab_state_path("../../etc/passwd")
+        self.assertEqual(path.parent.name, "tabs")
+        self.assertNotIn("..", path.name)
+
+    def test_empty_tab_id_falls_back(self):
+        self.assertEqual(htm.tab_state_path("").name, "unknown.json")
+        self.assertEqual(htm.tab_state_path(None).name, "unknown.json")
+
+    def test_safe_id_is_preserved(self):
+        self.assertEqual(htm.tab_state_path("w1t4").name, "w1t4.json")
+
+
+class TestOwnedTitle(unittest.TestCase):
+    """タブ所有権レコードから「自分が付けた名前」を取り出す。"""
+
+    def test_returns_recorded_title(self):
+        self.assertEqual(htm.owned_title({"title": "認証調査"}), "認証調査")
+
+    def test_missing_record_is_none(self):
+        self.assertIsNone(htm.owned_title({}))
+        self.assertIsNone(htm.owned_title(None))
+
+    def test_non_string_is_none(self):
+        # state が壊れていても落とさない
+        self.assertIsNone(htm.owned_title({"title": 5}))
+        self.assertIsNone(htm.owned_title({"title": None}))
+
+    def test_blank_is_none(self):
+        self.assertIsNone(htm.owned_title({"title": "   "}))
+
+
+class TestMayOverwriteAcrossSessions(unittest.TestCase):
+    """A の本丸: 別セッションでも自分の付けたタイトルは上書きできる。
+
+    従来は session_id 単位の state しか無く、新セッションでは
+    previous_title が None になって may_overwrite_title が必ず False を返した。
+    """
+
+    def test_own_title_from_another_session_is_overwritable(self):
+        # 新セッションなので session state は空。所有権はタブ側にある
+        tab_state = {"title": "認証調査"}
+        self.assertTrue(
+            htm.may_overwrite_title("認証調査", htm.owned_title(tab_state))
+        )
+
+    def test_manual_label_still_protected_with_tab_record(self):
+        # タブ側に別の名前が記録されていても、手動ラベルは守る
+        tab_state = {"title": "認証調査"}
+        self.assertFalse(htm.may_overwrite_title("ssh", htm.owned_title(tab_state)))
+
+    def test_manual_label_protected_with_no_record(self):
+        self.assertFalse(htm.may_overwrite_title("ssh", htm.owned_title({})))

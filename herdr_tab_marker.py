@@ -649,9 +649,44 @@ def generate_title(conversation_log: str, agent: str, max_width: int) -> str:
 # ---------------------------------------------------------------- 状態
 
 
+def _safe_stem(raw: str | None) -> str:
+    """任意の識別子をファイル名として安全な語に落とす。
+
+    `..` や `/` を含む値でもディレクトリの外へ出られないようにする。
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw or "")
+    # 連続するドットは親ディレクトリ参照になりうるので 1 つに潰す
+    safe = re.sub(r"\.{2,}", ".", safe)
+    # ドットや区切り文字だけの名前も親ディレクトリを指してしまう
+    if not safe.strip("._-"):
+        return "unknown"
+    return safe
+
+
 def state_path(session_id: str | None) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id or "") or "unknown"
-    return STATE_DIR / f"{safe}.json"
+    return STATE_DIR / f"{_safe_stem(session_id)}.json"
+
+
+TAB_STATE_SUBDIR = "tabs"
+
+
+def tab_state_dir() -> Path:
+    """タブ所有権レコードの置き場所。
+
+    STATE_DIR から呼び出し時に組み立てる。定数に畳むとテストが
+    STATE_DIR を差し替えても実 home に書き込んでしまう。
+    """
+    return STATE_DIR / TAB_STATE_SUBDIR
+
+
+def tab_state_path(tab_id: str | None) -> Path:
+    """タブ単位の所有権レコードのパス。
+
+    session_id 単位で持つと、新しいセッションを起動した時点で
+    「前に自分が付けた名前」を手動ラベルと誤認し、二度と更新できなくなる。
+    タブに紐づけて持てば、セッションを跨いでも自分の名前だと分かる。
+    """
+    return tab_state_dir() / f"{_safe_stem(tab_id)}.json"
 
 
 def load_state(path: Path) -> dict:
@@ -669,6 +704,16 @@ def save_state(path: Path, state: dict) -> None:
         log(f"cannot save state: {exc}")
 
 
+def save_tab_state(path: Path, state: dict) -> None:
+    """タブ所有権レコードを保存する。置き場所（tabs/）は無ければ作る。"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log(f"cannot create tab state dir: {exc}")
+        return
+    save_state(path, state)
+
+
 AUTO_LABEL_RE = re.compile(r"^\d+$")
 
 
@@ -681,6 +726,19 @@ def is_disposable_title(stripped_label: str | None) -> bool:
     if not stripped_label or not stripped_label.strip():
         return True
     return bool(AUTO_LABEL_RE.match(stripped_label.strip()))
+
+
+def owned_title(tab_state: dict | None) -> str | None:
+    """タブ所有権レコードから「この hook が付けた名前」を取り出す。
+
+    state が壊れていても落とさない。読めなければ所有権なしとして扱う。
+    """
+    if not isinstance(tab_state, dict):
+        return None
+    title = tab_state.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+    return title
 
 
 def may_overwrite_title(stripped_label: str | None, previous_title: str | None) -> bool:
@@ -732,7 +790,6 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     state = load_state(path)
     prompt_count = int(state.get("prompt_count", 0)) + 1
     generated_at = int(state.get("generated_at_prompt", 0))
-    previous_title = state.get("title")
     state["prompt_count"] = prompt_count
     save_state(path, state)
 
@@ -740,6 +797,11 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     if not tab_id:
         log("cannot resolve tab id; giving up")
         return
+
+    # 所有権はタブに紐づく。セッションを跨いでも自分の名前だと分かるようにする
+    tab_path = tab_state_path(tab_id)
+    tab_state = load_state(tab_path)
+    previous_title = owned_title(tab_state)
 
     marker_map = parse_marker_map(os.environ.get("HERDR_TAB_MARKER_MAP"))
     repo = detect_repo(hook_input.get("cwd"))
@@ -749,7 +811,9 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     current_label = get_tab_label(tab_id)
     # 手動ラベル判定は絵文字を剥がしてから行う。
     # 前回付けた絵文字も剥がす対象に含める（MAP から値を消しても取り残さないため）
-    current_title = strip_marker(current_label, marker_map, state.get("marker"))
+    current_title = strip_marker(
+        current_label, marker_map, tab_state.get("marker") or state.get("marker")
+    )
 
     budget = title_budget(MAX_WIDTH, marker)
     # 既定ラベル（連番）は持ち回らない。残すと `🟦 5` のような残骸になる
@@ -773,7 +837,6 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         generated = generate_title(conversation_log, detect_agent(hook_input), budget)
         if generated:
             title = generated
-            state["title"] = generated
             state["generated_at_prompt"] = prompt_count
         else:
             log("title generation produced nothing; keeping current title")
@@ -790,10 +853,16 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         return
     if rename_tab(tab_id, new_label):
         state["tab_id"] = tab_id
-        # 次回この絵文字を剥がせるように覚えておく（MAP を変更されても取り残さない）
-        state["marker"] = marker
         state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         save_state(path, state)
+        # 所有権レコードはタブ側に残す。次のセッションがこれを見て
+        # 「自分が付けた名前」だと判断できる
+        if title:
+            tab_state["title"] = title
+        # 次回この絵文字を剥がせるように覚えておく（MAP を変更されても取り残さない）
+        tab_state["marker"] = marker
+        tab_state["updated_at"] = state["updated_at"]
+        save_tab_state(tab_path, tab_state)
         log(f"renamed {current_label!r} -> {new_label!r}")
     else:
         log(f"rename to {new_label!r} failed")
