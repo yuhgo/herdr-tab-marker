@@ -556,3 +556,132 @@ class TestGcTabStates(unittest.TestCase):
         (d / "keep.txt").write_text("x", encoding="utf-8")
         htm.gc_tab_states(d, keep=2)
         self.assertTrue((d / "keep.txt").exists(), "json 以外を消してはいけない")
+
+
+class TestTokenizeForTopic(unittest.TestCase):
+    """話題比較用の語の切り出し。LLM を使わないのが B-2 の存在理由。"""
+
+    def test_ascii_words_are_lowercased(self):
+        self.assertIn("auth", htm.tokenize_for_topic("Auth まわりを調査"))
+
+    def test_japanese_runs_are_kept(self):
+        tokens = htm.tokenize_for_topic("認証まわりを調査する")
+        self.assertTrue(any("認証" in t for t in tokens))
+
+    def test_symbols_are_dropped(self):
+        self.assertEqual(htm.tokenize_for_topic("!!! ??? ---"), set())
+
+    def test_empty(self):
+        self.assertEqual(htm.tokenize_for_topic(""), set())
+        self.assertEqual(htm.tokenize_for_topic(None), set())
+
+    def test_short_ascii_noise_is_dropped(self):
+        # 1 文字の英字は話題を表さない
+        self.assertNotIn("a", htm.tokenize_for_topic("a b c auth"))
+
+
+class TestTopicChanged(unittest.TestCase):
+    """同話題なら生成しない / 別話題なら生成する。"""
+
+    def test_same_topic_is_not_changed(self):
+        self.assertFalse(
+            htm.topic_changed("認証まわりのテストを追加したい", "認証まわり調査")
+        )
+
+    def test_different_topic_is_changed(self):
+        self.assertTrue(
+            htm.topic_changed("課金の請求書PDFを直したい", "認証まわり調査")
+        )
+
+    def test_no_current_title_is_changed(self):
+        # タイトルが無ければ作るしかない
+        self.assertTrue(htm.topic_changed("何かの作業", ""))
+        self.assertTrue(htm.topic_changed("何かの作業", None))
+
+    def test_empty_prompt_is_not_changed(self):
+        # 判断材料が無いときは作り直さない（無駄な LLM 呼び出しを避ける）
+        self.assertFalse(htm.topic_changed("", "認証まわり調査"))
+
+    def test_ascii_same_topic(self):
+        self.assertFalse(htm.topic_changed("fix the auth token refresh", "auth token"))
+
+    def test_ascii_different_topic(self):
+        self.assertTrue(htm.topic_changed("update the billing invoice pdf", "auth token"))
+
+    def test_does_not_call_llm(self):
+        # 判定自体が有料になっては本末転倒
+        with mock.patch.object(htm, "generate_title") as gen:
+            htm.topic_changed("課金の請求書", "認証まわり調査")
+            gen.assert_not_called()
+
+
+class TestTopicChangedShortPrompts(unittest.TestCase):
+    """短い相づち・指示語で作り直さない。
+
+    語が数個しか無いプロンプトは「話題が変わった」根拠として弱い。
+    ここで生成に進むと、話題が続いているのに LLM を呼んでしまい
+    B-2 の目的（無駄な生成を減らす）と逆になる。
+    """
+
+    def test_thanks_does_not_regenerate(self):
+        self.assertFalse(htm.topic_changed("ありがとう", "認証まわり調査"))
+
+    def test_pronoun_only_does_not_regenerate(self):
+        self.assertFalse(htm.topic_changed("これも直して", "認証まわり調査"))
+
+    def test_ok_does_not_regenerate(self):
+        self.assertFalse(htm.topic_changed("ok", "auth token"))
+        self.assertFalse(htm.topic_changed("続けて", "認証まわり調査"))
+
+    def test_substantial_different_prompt_still_regenerates(self):
+        # 十分な語があれば従来どおり話題変化として扱う
+        self.assertTrue(
+            htm.topic_changed("課金の請求書PDFの出力を直したい", "認証まわり調査")
+        )
+
+
+class TestShouldRegenerate(unittest.TestCase):
+    """既定は話題変化モード。REGEN_EVERY 明示時のみ従来の N 回ごと。"""
+
+    def test_first_time_always_generates(self):
+        self.assertTrue(
+            htm.should_regenerate(
+                generated_at=0, prompt_count=1, regen_every=0,
+                recent_prompt="", current_title="",
+            )
+        )
+
+    def test_topic_mode_skips_same_topic(self):
+        self.assertFalse(
+            htm.should_regenerate(
+                generated_at=1, prompt_count=2, regen_every=0,
+                recent_prompt="認証まわりのテストを追加したい",
+                current_title="認証まわり調査",
+            )
+        )
+
+    def test_topic_mode_regenerates_on_new_topic(self):
+        self.assertTrue(
+            htm.should_regenerate(
+                generated_at=1, prompt_count=2, regen_every=0,
+                recent_prompt="課金の請求書PDFを直したい",
+                current_title="認証まわり調査",
+            )
+        )
+
+    def test_explicit_regen_every_keeps_counting(self):
+        # REGEN_EVERY=3 なら話題に関係なく 3 回ごと（後方互換）
+        same = dict(regen_every=3, recent_prompt="認証まわりのテスト",
+                    current_title="認証まわり調査")
+        self.assertFalse(htm.should_regenerate(generated_at=1, prompt_count=3, **same))
+        self.assertTrue(htm.should_regenerate(generated_at=1, prompt_count=4, **same))
+
+    def test_explicit_regen_every_ignores_topic_change(self):
+        # 明示指定時は話題が変わっても間隔を守る（従来動作）
+        self.assertFalse(
+            htm.should_regenerate(
+                generated_at=1, prompt_count=2, regen_every=5,
+                recent_prompt="課金の請求書PDFを直したい",
+                current_title="認証まわり調査",
+            )
+        )

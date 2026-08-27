@@ -659,6 +659,86 @@ class TestTabStateGcIsWired(unittest.TestCase):
         self.assertIn("w1_t4.json", remaining)
 
 
+class TestTopicRegenerationIsWired(unittest.TestCase):
+    """B-2 の受け入れ条件を run() 経由で確かめる。
+
+    同話題なら LLM を呼ばず、話題が変われば呼ぶ。
+    """
+
+    def _run(self, state_dir, home, session_id, current_label, prompt, regen_every=0):
+        fake = FakeHerdr({"result": {"tab": {"label": current_label}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": home,
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "REGEN_EVERY", regen_every), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title", return_value="課金請求書修正") as gen, \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                htm.run({
+                    "session_id": session_id,
+                    "cwd": os.getcwd(),
+                    "prompt": prompt,
+                })
+            return gen, rename
+        finally:
+            fake.close()
+
+    def _seed(self, state_dir, home):
+        """既に「認証まわり調査」が付いている状態を作る。"""
+        fake = FakeHerdr({"result": {"tab": {"label": "4"}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": home,
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title", return_value="認証まわり調査"), \
+                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
+                htm.run({"session_id": "s1", "cwd": os.getcwd(), "prompt": "認証を調べたい"})
+            return rename.call_args[0][1]
+        finally:
+            fake.close()
+
+    def test_same_topic_does_not_call_llm(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        label = self._seed(state_dir, home)
+        gen, _ = self._run(
+            state_dir, home, "s1", label, "認証まわりのテストを追加したい"
+        )
+        gen.assert_not_called()
+
+    def test_new_topic_calls_llm(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        label = self._seed(state_dir, home)
+        gen, rename = self._run(
+            state_dir, home, "s1", label, "課金の請求書PDFを直したい"
+        )
+        gen.assert_called_once()
+        self.assertTrue(rename.call_args[0][1].endswith("課金請求書修正"))
+
+    def test_explicit_regen_every_ignores_topic(self):
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        label = self._seed(state_dir, home)
+        # REGEN_EVERY=5 なら話題が変わっても間隔を守る（後方互換）
+        gen, _ = self._run(
+            state_dir, home, "s1", label, "課金の請求書PDFを直したい", regen_every=5
+        )
+        gen.assert_not_called()
+
+
 class TestDaemonizeFailure(unittest.TestCase):
     def test_fork_failure_falls_back_to_foreground(self):
         """fork に失敗しても hook 全体を落とさない。

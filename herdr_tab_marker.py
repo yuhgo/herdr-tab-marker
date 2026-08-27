@@ -646,6 +646,112 @@ def generate_title(conversation_log: str, agent: str, max_width: int) -> str:
     return sanitize_title(completed.stdout, max_width)
 
 
+# ---------------------------------------------------------------- 話題の変化
+
+# 助詞・助動詞など、話題を表さない 1〜2 文字語。bigram に混ざると
+# 無関係な文どうしが「似ている」と誤判定される
+STOP_BIGRAMS = frozenset(
+    {
+        "まわ", "わり", "した", "って", "てい", "でき", "ます", "です",
+        "ある", "いる", "する", "なる", "こと", "もの", "ため", "よう",
+    }
+)
+
+ASCII_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]+")
+CJK_RUN_RE = re.compile(r"[ぁ-んァ-ヶ一-龥ー]{2,}")
+
+# 語の重なりがこれ未満なら「話題が変わった」とみなす
+TOPIC_SIMILARITY_THRESHOLD = 0.20
+
+# 「話題が変わった」と言い切るのに要る最低限の中身の量（文字数）。
+# 「ありがとう」「これも直して」のような相づちは、いまの話題と語が重ならず
+# 重なり 0 になる。ここを通すと話題が続いているのに毎回生成してしまい、
+# B-2 の目的（無駄な生成を減らす）と逆になる。
+#
+# 語数ではなく文字数で測る。日本語は bigram に落とすため、短い相づちでも
+# 語数だけは増えてしまい（「ありがとう」→ 4 語）判断材料にならない。
+MIN_TOPIC_CHARS = 8
+
+
+def tokenize_for_topic(text: str | None) -> set:
+    """話題の比較に使う語を切り出す。
+
+    形態素解析器は使えない（標準ライブラリのみ）ので、日本語は文字 bigram に
+    落とす。厳密な語ではないが、「同じ話題か」を測るには十分な粒度になる。
+    """
+    if not text:
+        return set()
+    tokens = set()
+    # 英数字は語として拾う。1 文字は話題を表さないので落とす
+    for word in ASCII_WORD_RE.findall(text):
+        tokens.add(word.lower())
+    # 日本語は bigram に落とす
+    for run in CJK_RUN_RE.findall(text):
+        for i in range(len(run) - 1):
+            bigram = run[i : i + 2]
+            if bigram not in STOP_BIGRAMS:
+                tokens.add(bigram)
+    return tokens
+
+
+def topic_content(text: str | None) -> str:
+    """話題を表す部分だけを残す。記号や空白は量として数えない。"""
+    if not text:
+        return ""
+    return "".join(ASCII_WORD_RE.findall(text)) + "".join(CJK_RUN_RE.findall(text))
+
+
+def topic_changed(
+    recent_prompt: str | None,
+    current_title: str | None,
+    threshold: float = TOPIC_SIMILARITY_THRESHOLD,
+) -> bool:
+    """直近のプロンプトが、いまのタイトルと別の話題か。
+
+    **判定に LLM を使わない。** 判定自体が有料になっては本末転倒なので、
+    語の重なりだけで決める。
+
+    - タイトルが無い → 作るしかないので True
+    - プロンプトが空 → 判断材料が無い。無駄な生成を避けて False
+    """
+    if not current_title or not current_title.strip():
+        return True
+    # 短すぎるプロンプトは、話題変化の根拠として弱い。
+    # 相づちや指示語で作り直すと無駄な LLM 呼び出しになる
+    if len(topic_content(recent_prompt)) < MIN_TOPIC_CHARS:
+        return False
+    prompt_tokens = tokenize_for_topic(recent_prompt)
+    if not prompt_tokens:
+        return False
+    title_tokens = tokenize_for_topic(current_title)
+    if not title_tokens:
+        return True
+    overlap = prompt_tokens & title_tokens
+    # タイトルは短いので、タイトル側の語がどれだけ拾われたかで測る
+    similarity = len(overlap) / len(title_tokens)
+    return similarity < threshold
+
+
+def should_regenerate(
+    generated_at: int,
+    prompt_count: int,
+    regen_every: int,
+    recent_prompt: str | None,
+    current_title: str | None,
+) -> bool:
+    """いまタイトルを作り直すか。
+
+    - 初回（まだ一度も生成していない）: 必ず作る
+    - `REGEN_EVERY` 明示: 従来どおり N 回ごと。話題は見ない（後方互換）
+    - 既定（`REGEN_EVERY=0`）: 話題が変わった時だけ作る
+    """
+    if generated_at == 0:
+        return True
+    if regen_every > 0:
+        return prompt_count - generated_at >= regen_every
+    return topic_changed(recent_prompt, current_title)
+
+
 # ---------------------------------------------------------------- 状態
 
 
@@ -855,8 +961,11 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     title = "" if is_disposable_title(current_title) else current_title
 
     # タイトルを作り直すか判断する。
-    # REGEN_EVERY=0 は「最初に付けたら以後変えない」。
-    due = generated_at == 0 or (REGEN_EVERY > 0 and prompt_count - generated_at >= REGEN_EVERY)
+    # 既定は話題が変わった時だけ。REGEN_EVERY 明示時は従来の N 回ごと
+    current_prompt = hook_input.get("prompt") or ""
+    due = should_regenerate(
+        generated_at, prompt_count, REGEN_EVERY, current_prompt, title
+    )
     if not TITLE_ENABLED:
         log("title generation disabled; marker only")
     elif not due:
