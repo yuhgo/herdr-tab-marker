@@ -704,6 +704,41 @@ def save_state(path: Path, state: dict) -> None:
         log(f"cannot save state: {exc}")
 
 
+MAX_TAB_STATES = _env_int("MAX_TAB_STATES", 64)
+
+
+def gc_tab_states(directory: Path, keep: int | None = None) -> None:
+    """古いタブ所有権レコードを間引く。
+
+    タブは開くたびに増えるので、放っておくとレコードが際限なく溜まる。
+    更新が新しいものを keep 件だけ残す。消しても実害はない（そのタブの
+    タイトルが一度だけ手動ラベル扱いになるだけ）ので、失敗しても黙って続ける。
+    """
+    # 既定値を引数に畳むと、後から MAX_TAB_STATES を変えても効かない
+    if keep is None:
+        keep = MAX_TAB_STATES
+    if keep < 0:
+        return
+    try:
+        records = list(directory.glob("*.json"))
+    except OSError as exc:
+        log(f"cannot list tab states: {exc}")
+        return
+    if len(records) <= keep:
+        return
+    try:
+        # 更新が新しい順に並べ、あふれた分を落とす
+        records.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError as exc:
+        log(f"cannot stat tab states: {exc}")
+        return
+    for stale in records[keep:]:
+        try:
+            stale.unlink()
+        except OSError as exc:
+            log(f"cannot remove {stale.name}: {exc}")
+
+
 def save_tab_state(path: Path, state: dict) -> None:
     """タブ所有権レコードを保存する。置き場所（tabs/）は無ければ作る。"""
     try:
@@ -863,6 +898,8 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         tab_state["marker"] = marker
         tab_state["updated_at"] = state["updated_at"]
         save_tab_state(tab_path, tab_state)
+        # 保存した後に間引く。いま書いたレコードが最新なので必ず残る
+        gc_tab_states(tab_state_dir())
         log(f"renamed {current_label!r} -> {new_label!r}")
     else:
         log(f"rename to {new_label!r} failed")

@@ -622,6 +622,43 @@ class TestCrossSessionOwnership(unittest.TestCase):
         self.assertEqual(record.get("title"), "認証調査")
 
 
+class TestTabStateGcIsWired(unittest.TestCase):
+    """GC は run() から実際に呼ばれること。関数があるだけでは溜まり続ける。"""
+
+    def test_run_prunes_old_tab_records(self):
+        state_dir = Path(tempfile.mkdtemp())
+        tabs = state_dir / "tabs"
+        tabs.mkdir(parents=True)
+        # 上限を超える残骸を先に置く
+        for i in range(8):
+            stale = tabs / f"w9_t{i}.json"
+            stale.write_text('{"title": "古い"}', encoding="utf-8")
+            os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+        fake = FakeHerdr({"result": {"tab": {"label": "4"}}})
+        try:
+            env = {
+                "HERDR_SOCKET_PATH": fake.path,
+                "HERDR_TAB_ID": "w1:t4",
+                "HOME": tempfile.mkdtemp(),
+            }
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(htm, "STATE_DIR", state_dir), \
+                 mock.patch.object(htm, "MAX_TAB_STATES", 3), \
+                 mock.patch.object(htm, "TITLE_ENABLED", True), \
+                 mock.patch.object(htm, "read_prompts", return_value="ログ"), \
+                 mock.patch.object(htm, "generate_title", return_value="認証調査"), \
+                 mock.patch.object(htm, "rename_tab", return_value=True):
+                htm.run({"session_id": "s1", "cwd": os.getcwd()})
+        finally:
+            fake.close()
+
+        remaining = sorted(p.name for p in tabs.glob("*.json"))
+        self.assertEqual(len(remaining), 3, remaining)
+        # いま書いたレコードは最新なので必ず残る
+        self.assertIn("w1_t4.json", remaining)
+
+
 class TestDaemonizeFailure(unittest.TestCase):
     def test_fork_failure_falls_back_to_foreground(self):
         """fork に失敗しても hook 全体を落とさない。

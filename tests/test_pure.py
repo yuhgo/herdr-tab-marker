@@ -3,8 +3,10 @@
 ソケットも LLM も要らない関数だけを対象にする。
 """
 
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -518,3 +520,39 @@ class TestMayOverwriteAcrossSessions(unittest.TestCase):
 
     def test_manual_label_protected_with_no_record(self):
         self.assertFalse(htm.may_overwrite_title("ssh", htm.owned_title({})))
+
+
+class TestGcTabStates(unittest.TestCase):
+    """所有権レコードの GC。放っておくとタブの数だけ増え続ける。"""
+
+    def _make(self, count, mtime_base=1_700_000_000):
+        d = Path(tempfile.mkdtemp()) / "tabs"
+        d.mkdir(parents=True)
+        for i in range(count):
+            f = d / f"w1_t{i}.json"
+            f.write_text('{"title": "x"}', encoding="utf-8")
+            # 若い番号ほど古い
+            os.utime(f, (mtime_base + i, mtime_base + i))
+        return d
+
+    def test_keeps_newest_up_to_limit(self):
+        d = self._make(10)
+        htm.gc_tab_states(d, keep=4)
+        remaining = sorted(p.name for p in d.glob("*.json"))
+        self.assertEqual(len(remaining), 4)
+        # 新しい方（番号が大きい方）が残る
+        self.assertEqual(remaining, ["w1_t6.json", "w1_t7.json", "w1_t8.json", "w1_t9.json"])
+
+    def test_under_limit_is_untouched(self):
+        d = self._make(3)
+        htm.gc_tab_states(d, keep=10)
+        self.assertEqual(len(list(d.glob("*.json"))), 3)
+
+    def test_missing_dir_is_safe(self):
+        htm.gc_tab_states(Path("/nonexistent/tabs"), keep=5)  # 例外を出さない
+
+    def test_only_touches_json(self):
+        d = self._make(6)
+        (d / "keep.txt").write_text("x", encoding="utf-8")
+        htm.gc_tab_states(d, keep=2)
+        self.assertTrue((d / "keep.txt").exists(), "json 以外を消してはいけない")
