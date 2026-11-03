@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""herdr のタブ名に「リポジトリを表す絵文字」と「作業内容のタイトル」を付ける hook。
+"""herdr のタブ名に「作業内容のタイトル」を付ける hook。
 
-    🟦 認証まわりを調査
-    ^^ ^^^^^^^^^^^^^^^
-    │  └─ 会話ログから LLM が生成（手動ラベルは尊重して上書きしない）
-    └──── 作業中のリポジトリから決まる（コストゼロ・常に付ける）
-
-herdr 0.7.3 にはタブ個別の色を設定する API が無く、外部から触れるのは label だけなので、
-色の代わりに絵文字で視覚的な弁別性を得ている（herdr 0.7.3 で確認）。
+タイトルは会話ログから LLM が生成する（手動ラベルは尊重して上書きしない）。
+以前はリポジトリを表す絵文字も先頭に付けていたが、0.2.0 で外した。
 
 Claude Code / Codex の UserPromptSubmit hook として呼ばれる。herdr の外では何もしない。
 
@@ -29,7 +24,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 SOURCE = "herdr-tab-marker"
 
 # ---------------------------------------------------------------- 設定
@@ -78,9 +73,9 @@ def _resolve_lang(raw: str) -> str:
     return EN if current.lower().startswith("en") else JA
 
 
-MARKER_ENABLED = _env_flag("MARKER", "1")
 TITLE_ENABLED = _env_flag("TITLE", "1")
-MAX_WIDTH = _env_int("MAX_WIDTH", 28)
+# herdr のサイドバーの幅（sidebar_width = 44）に合わせる
+MAX_WIDTH = _env_int("MAX_WIDTH", 44)
 REGEN_EVERY = _env_int("REGEN_EVERY", 0)
 TIMEOUT_SEC = _env_int("TIMEOUT_SEC", 90)
 MAX_LOG_CHARS = _env_int("MAX_LOG_CHARS", 1500)
@@ -89,21 +84,6 @@ MODEL = _env("MODEL", "haiku")
 LANG = _resolve_lang(_env("LANG", "auto"))
 DEBUG = _env_flag("DEBUG")
 FOREGROUND = _env_flag("FOREGROUND")
-
-# マーカーに使う絵文字。
-#
-# 選定条件:
-#   - 表示幅がちょうど 2 カラム（East Asian Width が W か F）
-#   - 単体で完結する（肌の色や性別の修飾子・ZWJ 結合を持たない）
-#   - 互いに見分けやすい
-#
-# 順番を変えると既存タブの絵文字が変わるので、追加は末尾に行う。
-PALETTE = (
-    "🟦", "🟩", "🟨", "🟧", "🟥", "🟪", "🟫", "⬛",
-    "🔷", "🔶", "🔺", "🔻", "⭐", "🌙", "🔥", "💧",
-    "🌱", "🍀", "🌸", "🍁", "🐳", "🐙", "🦊", "🐰",
-    "🍎", "🍊", "🍋", "🍇", "⚡", "❄", "🎯", "🎲",
-)
 
 # ---------------------------------------------------------------- ログ
 
@@ -160,147 +140,18 @@ def truncate(text: str, max_width: int) -> str:
     return "".join(out).rstrip(TRIM_CHARS) + "…"
 
 
-# ---------------------------------------------------------------- マーカー
-
 PREFIX_RE = re.compile(r"^(タイトル|title)\s*[:：]\s*", re.IGNORECASE)
 
 
-def parse_marker_map(raw: str | None) -> dict:
-    """HERDR_TAB_MARKER_MAP を読む。壊れていても hook 全体は落とさない。"""
-    if not raw or not raw.strip():
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        log(f"HERDR_TAB_MARKER_MAP is not valid JSON: {str(raw)[:120]!r}")
-        return {}
-    if not isinstance(parsed, dict):
-        log("HERDR_TAB_MARKER_MAP is not a JSON object; ignoring")
-        return {}
-    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, str) and v}
+def strip_legacy_marker(label: str | None, previous_marker: str | None) -> str:
+    """0.1.x がタブ名の先頭に付けた絵文字を剥がす。
 
-
-def _digest(text: str) -> int:
-    """安定ハッシュ。
-
-    組み込みの hash() は PYTHONHASHSEED で実行ごとに変わるため使えない。
-    同じリポジトリなら常に同じ絵文字、マシンをまたいでも一致させたいので自前で畳み込む。
+    剥がすのは、そのタブの記録に残っている絵文字だけ（人が付けた絵文字は残す）。
     """
-    value = 0
-    for ch in text:
-        value = (value * 131 + ord(ch)) & 0xFFFFFFFF
-    return value
-
-
-def marker_for(repo: str | None, marker_map: dict) -> str | None:
-    """リポジトリ名に対応する絵文字を返す。"""
-    if not repo:
-        return None
-    explicit = marker_map.get(repo)
-    if explicit:
-        return explicit
-    return PALETTE[_digest(repo) % len(PALETTE)]
-
-
-def known_markers(marker_map: dict, previous_marker: str | None = None) -> tuple:
-    """自分が付けうる絵文字の一覧。
-
-    「絵文字とは何か」を正規表現で書き切るのは無理なので、
-    剥がす対象を自分が付けうるものだけに限定する。
-
-    previous_marker には state に記録した「前回このタブに付けた絵文字」を渡す。
-    HERDR_TAB_MARKER_MAP から値を消したあとでも、それで付けたタブ名を剥がせるようにするため。
-    渡さないと `🔧 dotfiles` が手動ラベルと誤認され、以後タイトルが更新されなくなる。
-    """
-    markers = tuple(PALETTE) + tuple(marker_map.values())
-    if previous_marker and previous_marker not in markers:
-        markers += (previous_marker,)
-    return markers
-
-
-def strip_marker(
-    label: str | None, marker_map: dict, previous_marker: str | None = None
-) -> str:
-    """タブ名の先頭から自分が付けた絵文字を剥がす。
-
-    毎回先頭に足すと 🟦🟦🟦 と積み上がるので、貼り替える前に剥がす。
-    """
-    if not label:
-        return ""
-    text = label
-    markers = known_markers(marker_map, previous_marker)
-    changed = True
-    while changed:
-        changed = False
-        for marker in markers:
-            if text.startswith(marker):
-                text = text[len(marker):]
-                changed = True
+    text = (label or "").strip()
+    if previous_marker and text.startswith(previous_marker):
+        text = text[len(previous_marker):]
     return text.strip()
-
-
-def compose_label(marker: str | None, title: str) -> str:
-    if marker and title:
-        return f"{marker} {title}"
-    if marker:
-        return marker
-    return title
-
-
-def title_budget(max_width: int, marker: str | None) -> int:
-    """タイトルに使える幅。マーカー分（絵文字 2 + 空白 1）を引く。"""
-    if not marker:
-        return max_width
-    return max(0, max_width - display_width(marker) - 1)
-
-
-# ---------------------------------------------------------------- リポジトリ検出
-
-
-def detect_repo(cwd: str | None, env: dict | None = None) -> str | None:
-    """作業中のリポジトリ名を返す。
-
-    `--git-common-dir` を使う理由: worktree で作業していると `--show-toplevel` は
-    worktree 側のディレクトリ名（wt-feature-branch など）を返してしまい、
-    同じリポジトリなのに絵文字が変わる。common dir はリポジトリ本体を指す。
-    """
-    if not cwd or not os.path.isdir(cwd):
-        return None
-    run_env = dict(os.environ)
-    if env:
-        run_env.update(env)
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-            env=run_env,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log(f"git rev-parse failed: {exc}")
-        return None
-    if completed.returncode != 0:
-        return None
-    common_dir = completed.stdout.strip()
-    if not common_dir:
-        return None
-    # 相対パス（"." や ".git"）で返ることがあるので cwd 基準で解決する
-    path = Path(common_dir)
-    if not path.is_absolute():
-        path = Path(cwd) / path
-    try:
-        path = path.resolve()
-    except OSError:
-        return None
-    # 通常のリポジトリ: /path/to/myproject/.git → myproject
-    # bare リポジトリ:   /path/to/myproject.git  → myproject
-    name = path.parent.name if path.name == ".git" else path.name
-    if name.endswith(".git"):
-        name = name[: -len(".git")]
-    return name or None
 
 
 # ---------------------------------------------------------------- herdr ソケット
@@ -886,7 +737,7 @@ def owned_title(tab_state: dict | None) -> str | None:
 def may_overwrite_title(stripped_label: str | None, previous_title: str | None) -> bool:
     """このタイトル部分を上書きしてよいか判定する。
 
-    必ず strip_marker を通した文字列を渡すこと。絵文字が付いたままだと
+    必ず strip_legacy_marker を通した文字列を渡すこと。0.1.x の絵文字が付いたままだと
     前回自分が付けた名前を手動ラベルと誤認する。
 
     上書きしてよいのは 3 つだけ:
@@ -948,54 +799,46 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     # 話題が続いていても必ず生成してしまう
     generated_at = int(tab_state.get("generated_at_prompt", 0) or 0)
 
-    marker_map = parse_marker_map(os.environ.get("HERDR_TAB_MARKER_MAP"))
-    repo = detect_repo(hook_input.get("cwd"))
-    marker = marker_for(repo, marker_map) if MARKER_ENABLED else None
-    log(f"tab={tab_id} repo={repo!r} marker={marker!r} prompt={prompt_count}")
+    log(f"tab={tab_id} prompt={prompt_count}")
 
     current_label = get_tab_label(tab_id)
-    # 手動ラベル判定は絵文字を剥がしてから行う。
-    # 前回付けた絵文字も剥がす対象に含める（MAP から値を消しても取り残さないため）
-    current_title = strip_marker(
-        current_label, marker_map, tab_state.get("marker") or state.get("marker")
-    )
-
-    budget = title_budget(MAX_WIDTH, marker)
-    # 既定ラベル（連番）は持ち回らない。残すと `🟦 5` のような残骸になる
-    title = "" if is_disposable_title(current_title) else current_title
+    # 0.1.x は先頭にリポジトリの絵文字を付けていた。そのとき付けた絵文字だけは剥がしてから比べる
+    # （剥がさないと、自分が付けた名前を手動ラベルと誤認して二度と更新できなくなる）
+    current_title = strip_legacy_marker(current_label, tab_state.get("marker") or state.get("marker"))
 
     # タイトルを作り直すか判断する。
     # 既定は話題が変わった時だけ。REGEN_EVERY 明示時は従来の N 回ごと
     current_prompt = hook_input.get("prompt") or ""
     due = should_regenerate(
-        generated_at, prompt_count, REGEN_EVERY, current_prompt, title
+        generated_at,
+        prompt_count,
+        REGEN_EVERY,
+        current_prompt,
+        "" if is_disposable_title(current_title) else current_title,
     )
     if not TITLE_ENABLED:
-        log("title generation disabled; marker only")
-    elif not due:
-        log(f"title not due (generated_at={generated_at}, regen_every={REGEN_EVERY})")
-    elif not may_overwrite_title(current_title, previous_title):
-        log(f"title part {current_title!r} looks manual; leaving it alone")
-    else:
-        conversation_log = read_prompts(
-            hook_input.get("transcript_path"),
-            MAX_LOG_CHARS,
-            hook_input.get("prompt") or "",
-        )
-        generated = generate_title(conversation_log, detect_agent(hook_input), budget)
-        if generated:
-            title = generated
-            tab_state["generated_at_prompt"] = prompt_count
-        else:
-            log("title generation produced nothing; keeping current title")
-
-    # 手動ラベルでもマーカーは付ける。ただし幅は超えないように詰める
-    title = truncate(title, budget) if title else ""
-    new_label = compose_label(marker, title)
-
-    if not new_label:
-        log("nothing to set; leaving tab as-is")
+        log("title generation disabled; nothing to do")
         return
+    if not due:
+        log(f"title not due (generated_at={generated_at}, regen_every={REGEN_EVERY})")
+        return
+    # 手動ラベル（人やオーケストレーターが付けた名前）には一切触らない。切り詰めもしない
+    if not may_overwrite_title(current_title, previous_title):
+        log(f"title {current_title!r} looks manual; leaving it alone")
+        return
+    conversation_log = read_prompts(
+        hook_input.get("transcript_path"),
+        MAX_LOG_CHARS,
+        hook_input.get("prompt") or "",
+    )
+    generated = generate_title(conversation_log, detect_agent(hook_input), MAX_WIDTH)
+    if not generated:
+        log("title generation produced nothing; keeping current title")
+        return
+    title = truncate(generated, MAX_WIDTH)
+    tab_state["generated_at_prompt"] = prompt_count
+    new_label = title
+
     if new_label == current_label:
         log(f"label already {new_label!r}; no rename needed")
         return
@@ -1005,10 +848,9 @@ def _run_locked(hook_input: dict, path: Path) -> None:
         save_state(path, state)
         # 所有権レコードはタブ側に残す。次のセッションがこれを見て
         # 「自分が付けた名前」だと判断できる
-        if title:
-            tab_state["title"] = title
-        # 次回この絵文字を剥がせるように覚えておく（MAP を変更されても取り残さない）
-        tab_state["marker"] = marker
+        tab_state["title"] = title
+        # 絵文字はもう付けないので、0.1.x の記録は消しておく
+        tab_state.pop("marker", None)
         tab_state["updated_at"] = state["updated_at"]
         save_tab_state(tab_path, tab_state)
         # 保存した後に間引く。いま書いたレコードが最新なので必ず残る
@@ -1063,7 +905,7 @@ def main() -> int:
     if not os.environ.get("HERDR_SOCKET_PATH"):
         log("HERDR_SOCKET_PATH is not set; giving up")
         return 0
-    if not MARKER_ENABLED and not TITLE_ENABLED:
+    if not TITLE_ENABLED:
         return 0
 
     if FOREGROUND:

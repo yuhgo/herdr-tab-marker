@@ -449,7 +449,7 @@ class TestTitleDisabledMode(unittest.TestCase):
 class TestManualLabelIntegration(unittest.TestCase):
     """手動ラベル保護を run() 経由で一巡させる統合テスト。
 
-    「タイトルは尊重、絵文字は付ける」が本実装の中核なので、
+    「手動ラベルには一切触らない」が本実装の中核なので、
     純粋関数のテストだけでなく通しでも固定する。
     """
 
@@ -475,89 +475,25 @@ class TestManualLabelIntegration(unittest.TestCase):
         finally:
             fake.close()
 
-    def test_manual_label_keeps_title_but_gains_marker(self):
+    def test_manual_label_is_left_untouched(self):
         generate, rename = self._run("ssh")
         # 手動ラベルなので LLM は呼ばない（コストゼロ）
         generate.assert_not_called()
-        # 絵文字だけ付く
-        self.assertEqual(rename.call_count, 1)
-        new_label = rename.call_args[0][1]
-        self.assertTrue(new_label.endswith(" ssh"), new_label)
-        self.assertNotEqual(new_label, "ssh")
+        # 名前も変えない
+        rename.assert_not_called()
+
+    def test_long_manual_label_is_not_truncated(self):
+        # オーケストレーターが付けた長い名前を MAX_WIDTH で切り詰めない
+        label = "#1454 [grill] 役割ごとのモデル・effort・api-version を型付きレジストリで持つ"
+        generate, rename = self._run(label)
+        generate.assert_not_called()
+        rename.assert_not_called()
 
     def test_default_numeric_label_is_replaced_by_title(self):
         generate, rename = self._run("4")
         generate.assert_called_once()
-        new_label = rename.call_args[0][1]
-        self.assertTrue(new_label.endswith("生成されたタイトル"), new_label)
-        # 連番は残さない
-        self.assertNotIn("4", new_label)
-
-    def test_already_marked_manual_label_is_not_double_marked(self):
-        # 前回 marker を付けた状態で再実行しても increment しない
-        repo = htm.detect_repo(os.getcwd())
-        marker = htm.marker_for(repo, {})
-        generate, rename = self._run(f"{marker} ssh")
-        generate.assert_not_called()
-        rename.assert_not_called()  # 変化なしなので rename も呼ばない
-
-
-class TestMarkerPersistence(unittest.TestCase):
-    """state に使った絵文字を記録し、MAP 変更後も剥がせること。
-
-    記録が漏れると `🔧 dotfiles` が手動ラベルと誤認され、
-    以後そのタブのタイトルが永久に更新されなくなる。
-    """
-
-    def _run_once(self, state_dir, current_label, marker_map_json, home):
-        fake = FakeHerdr({"result": {"tab": {"label": current_label}}})
-        try:
-            env = {
-                "HERDR_SOCKET_PATH": fake.path,
-                "HERDR_TAB_ID": "w1:t4",
-                "HOME": home,
-            }
-            if marker_map_json:
-                env["HERDR_TAB_MARKER_MAP"] = marker_map_json
-            with mock.patch.dict(os.environ, env, clear=True), \
-                 mock.patch.object(htm, "STATE_DIR", state_dir), \
-                 mock.patch.object(htm, "TITLE_ENABLED", False), \
-                 mock.patch.object(htm, "rename_tab", return_value=True) as rename:
-                htm.run({"session_id": "s1", "cwd": os.getcwd()})
-            return rename
-        finally:
-            fake.close()
-
-    def test_marker_is_recorded_in_tab_state(self):
-        """絵文字の記録先はタブ所有権レコード。
-
-        セッション単位に置くと、新セッションで剥がせなくなり
-        `🔧 dotfiles` が手動ラベルと誤認される。
-        """
-        state_dir = Path(tempfile.mkdtemp())
-        home = tempfile.mkdtemp()
-        repo = htm.detect_repo(os.getcwd())
-        self._run_once(state_dir, "4", f'{{"{repo}":"🔧"}}', home)
-        tab_state = htm.load_state(state_dir / "tabs" / "w1_t4.json")
-        self.assertEqual(
-            tab_state.get("marker"), "🔧", "使った絵文字がタブ state に記録されていない"
-        )
-
-    def test_removed_map_value_is_still_stripped(self):
-        state_dir = Path(tempfile.mkdtemp())
-        home = tempfile.mkdtemp()
-        repo = htm.detect_repo(os.getcwd())
-        # 1 回目: MAP ありで 🔧 を付ける
-        self._run_once(state_dir, "4", f'{{"{repo}":"🔧"}}', home)
-        # 2 回目: MAP を消した状態で、🔧 が付いたラベルを渡す
-        rename = self._run_once(state_dir, "🔧 手動の名前", None, home)
-        self.assertEqual(rename.call_count, 1)
-        new_label = rename.call_args[0][1]
-        # 🔧 は剥がされ、パレット由来の絵文字に貼り替わる
-        self.assertNotIn("🔧", new_label)
-        self.assertTrue(new_label.endswith("手動の名前"), new_label)
-        # 二重に絵文字が付いていない
-        self.assertEqual(htm.display_width(new_label), 2 + 1 + htm.display_width("手動の名前"))
+        # 絵文字を付けず、タイトルだけにする
+        self.assertEqual(rename.call_args[0][1], "生成されたタイトル")
 
 
 class TestCrossSessionOwnership(unittest.TestCase):
@@ -615,14 +551,30 @@ class TestCrossSessionOwnership(unittest.TestCase):
         state_dir = Path(tempfile.mkdtemp())
         home = tempfile.mkdtemp()
         # 1 回目でタブ所有権を作る
-        _, rename1 = self._run(state_dir, home, "s1", "4", "認証調査")
-        marker = rename1.call_args[0][1].split(" ", 1)[0]
+        self._run(state_dir, home, "s1", "4", "認証調査")
 
         # 2 回目: 人が手で `ssh` に付け替えた状態
-        gen2, rename2 = self._run(state_dir, home, "s2", f"{marker} ssh", "課金修正")
+        gen2, rename2 = self._run(state_dir, home, "s2", "ssh", "課金修正")
         gen2.assert_not_called()  # 手動ラベルなので LLM を呼ばない
-        if rename2.called:
-            self.assertTrue(rename2.call_args[0][1].endswith("ssh"))
+        rename2.assert_not_called()
+
+    def test_legacy_marked_own_title_can_be_updated(self):
+        # 0.1.x が絵文字つきで付けた自分の名前は、記録した絵文字を剥がして自分のものと分かる
+        state_dir = Path(tempfile.mkdtemp())
+        home = tempfile.mkdtemp()
+        tabs = state_dir / "tabs"
+        tabs.mkdir(parents=True)
+        (tabs / "w1_t4.json").write_text(
+            '{"title": "認証調査", "marker": "🐳", "generated_at_prompt": 1}', encoding="utf-8"
+        )
+        gen, rename = self._run(
+            state_dir, home, "s2", "🐳 認証調査", "課金修正",
+            prompt="課金の請求書PDFの出力を直したい",
+        )
+        gen.assert_called_once()
+        self.assertEqual(rename.call_args[0][1], "課金修正")
+        record = htm.load_state(tabs / "w1_t4.json")
+        self.assertNotIn("marker", record)
 
     def test_ownership_record_lives_under_tabs_dir(self):
         state_dir = Path(tempfile.mkdtemp())

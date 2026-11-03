@@ -102,126 +102,6 @@ class TestStatePath(unittest.TestCase):
         self.assertEqual(htm.state_path("abc-123_x.y").name, "abc-123_x.y.json")
 
 
-class TestMarkerFor(unittest.TestCase):
-    def test_explicit_map_wins(self):
-        self.assertEqual(htm.marker_for("dotfiles", {"dotfiles": "🔧"}), "🔧")
-
-    def test_falls_back_to_palette(self):
-        marker = htm.marker_for("herdr-tab-marker", {})
-        self.assertIn(marker, htm.PALETTE)
-
-    def test_stable_within_process(self):
-        a = htm.marker_for("some-repo", {})
-        b = htm.marker_for("some-repo", {})
-        self.assertEqual(a, b)
-
-    def test_stable_across_processes(self):
-        """組み込み hash() は PYTHONHASHSEED で変わるので使っていないことの確認。
-
-        絵文字が実行ごとに変わると識別子として機能しない。別プロセスで seed を変えて実行し、
-        同じ絵文字が返ることを確かめる。
-        """
-        root = str(Path(__file__).resolve().parent.parent)
-        code = (
-            f"import sys; sys.path.insert(0, {root!r});"
-            "import herdr_tab_marker as h;"
-            "print(h.marker_for('innocom-learning-platform', {}))"
-        )
-        results = set()
-        for seed in ("0", "1", "12345"):
-            out = subprocess.run(
-                [sys.executable, "-c", code],
-                capture_output=True,
-                text=True,
-                check=True,
-                env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin"},
-            )
-            results.add(out.stdout.strip())
-        self.assertEqual(
-            len(results), 1, f"marker changed across hash seeds: {results}"
-        )
-
-    def test_distributes_across_palette(self):
-        names = [f"repo-{i}" for i in range(200)]
-        used = {htm.marker_for(n, {}) for n in names}
-        # 全部同じ絵文字に潰れていない（ハッシュが機能している）
-        self.assertGreater(len(used), len(htm.PALETTE) // 2)
-
-    def test_empty_name_returns_none(self):
-        self.assertIsNone(htm.marker_for("", {}))
-        self.assertIsNone(htm.marker_for(None, {}))
-
-    def test_palette_has_no_duplicates(self):
-        self.assertEqual(len(htm.PALETTE), len(set(htm.PALETTE)))
-
-    def test_palette_markers_are_two_columns(self):
-        for marker in htm.PALETTE:
-            self.assertEqual(
-                htm.display_width(marker), 2, f"{marker!r} is not 2 columns"
-            )
-
-
-class TestStripMarker(unittest.TestCase):
-    def test_strips_palette_marker(self):
-        marker = htm.PALETTE[0]
-        self.assertEqual(htm.strip_marker(f"{marker} ssh", {}), "ssh")
-
-    def test_strips_repeated_markers(self):
-        marker = htm.PALETTE[0]
-        self.assertEqual(htm.strip_marker(f"{marker}{marker} x", {}), "x")
-
-    def test_no_marker_is_unchanged(self):
-        self.assertEqual(htm.strip_marker("ssh", {}), "ssh")
-
-    def test_strips_map_values_too(self):
-        self.assertEqual(htm.strip_marker("🔧 dotfiles", {"dotfiles": "🔧"}), "dotfiles")
-
-    def test_leaves_unknown_emoji_alone(self):
-        """自分が付けうるものだけを剥がす。
-
-        「絵文字とは何か」を正規表現で書き切ろうとしない方針の確認。
-        """
-        self.assertEqual(htm.strip_marker("🦄 unicorn", {}), "🦄 unicorn")
-
-    def test_strips_without_space(self):
-        marker = htm.PALETTE[0]
-        self.assertEqual(htm.strip_marker(f"{marker}ssh", {}), "ssh")
-
-    def test_marker_only_becomes_empty(self):
-        marker = htm.PALETTE[0]
-        self.assertEqual(htm.strip_marker(f"{marker} ", {}), "")
-
-    def test_handles_none(self):
-        self.assertEqual(htm.strip_marker(None, {}), "")
-
-    def test_does_not_strip_from_middle(self):
-        marker = htm.PALETTE[0]
-        self.assertEqual(htm.strip_marker(f"ssh {marker}", {}), f"ssh {marker}")
-
-    def test_strips_previously_used_marker(self):
-        """MAP から消えた絵文字も、以前使ったものなら剥がせる。
-
-        `{"dotfiles":"🔧"}` を設定していたタブ名 `🔧 dotfiles` が残った状態で
-        MAP を削除すると、剥がせないまま手動ラベルと誤認されて
-        以後タイトル生成が永久に止まってしまう。
-        """
-        self.assertEqual(
-            htm.strip_marker("🔧 dotfiles", {}, previous_marker="🔧"), "dotfiles"
-        )
-
-    def test_previous_marker_none_is_harmless(self):
-        marker = htm.PALETTE[0]
-        self.assertEqual(
-            htm.strip_marker(f"{marker} x", {}, previous_marker=None), "x"
-        )
-
-    def test_previous_marker_does_not_widen_to_unknown(self):
-        # 記録済みのもの以外は依然として剥がさない
-        self.assertEqual(
-            htm.strip_marker("🦄 unicorn", {}, previous_marker="🔧"), "🦄 unicorn"
-        )
-
-
 class TestMayOverwriteTitle(unittest.TestCase):
     def test_empty_is_overwritable(self):
         self.assertTrue(htm.may_overwrite_title("", None))
@@ -240,15 +120,31 @@ class TestMayOverwriteTitle(unittest.TestCase):
         self.assertFalse(htm.may_overwrite_title("ssh", "認証調査"))
 
     def test_judged_after_strip(self):
-        """剥がしてから判定しないと前回の自分の名前を誤認する。"""
-        marker = htm.PALETTE[0]
+        """0.1.x の絵文字を剥がしてから判定しないと、前回の自分の名前を誤認する。"""
         previous = "認証調査"
-        labelled = f"{marker} {previous}"
+        labelled = f"🐳 {previous}"
         # 剥がさずに渡すと手動ラベル扱いになってしまう（誤った使い方）
         self.assertFalse(htm.may_overwrite_title(labelled, previous))
         # 剥がしてから渡すのが正しい
-        stripped = htm.strip_marker(labelled, {})
+        stripped = htm.strip_legacy_marker(labelled, "🐳")
         self.assertTrue(htm.may_overwrite_title(stripped, previous))
+
+
+class TestStripLegacyMarker(unittest.TestCase):
+    """0.1.x が付けた絵文字は、そのタブの記録にある分だけ剥がす。"""
+
+    def test_strips_recorded_marker(self):
+        self.assertEqual(htm.strip_legacy_marker("🐳 認証調査", "🐳"), "認証調査")
+
+    def test_keeps_unrecorded_emoji(self):
+        # 人が付けた絵文字は残す
+        self.assertEqual(htm.strip_legacy_marker("🦄 unicorn", "🐳"), "🦄 unicorn")
+
+    def test_no_record_is_unchanged(self):
+        self.assertEqual(htm.strip_legacy_marker("🐳 ssh", None), "🐳 ssh")
+
+    def test_none_label_is_empty(self):
+        self.assertEqual(htm.strip_legacy_marker(None, "🐳"), "")
 
 
 class TestIsDisposableTitle(unittest.TestCase):
@@ -274,51 +170,6 @@ class TestIsDisposableTitle(unittest.TestCase):
         # 連番だけが対象。数字を含む名前は捨てない
         self.assertFalse(htm.is_disposable_title("v2"))
         self.assertFalse(htm.is_disposable_title("phase 3"))
-
-
-class TestComposeLabel(unittest.TestCase):
-    def test_marker_and_title(self):
-        self.assertEqual(htm.compose_label("🟦", "認証調査"), "🟦 認証調査")
-
-    def test_title_only(self):
-        self.assertEqual(htm.compose_label(None, "認証調査"), "認証調査")
-
-    def test_marker_only(self):
-        self.assertEqual(htm.compose_label("🟦", ""), "🟦")
-
-    def test_both_empty(self):
-        self.assertEqual(htm.compose_label(None, ""), "")
-
-
-class TestTitleBudget(unittest.TestCase):
-    def test_marker_reserves_three_columns(self):
-        """絵文字 2 カラム + 空白 1 = 3 を引く。"""
-        self.assertEqual(htm.title_budget(28, "🟦"), 25)
-
-    def test_no_marker_uses_full_width(self):
-        self.assertEqual(htm.title_budget(28, None), 28)
-
-    def test_never_negative(self):
-        self.assertGreaterEqual(htm.title_budget(2, "🟦"), 0)
-
-
-class TestParseMarkerMap(unittest.TestCase):
-    def test_parses_json(self):
-        self.assertEqual(htm.parse_marker_map('{"dotfiles":"🔧"}'), {"dotfiles": "🔧"})
-
-    def test_empty_returns_empty_dict(self):
-        self.assertEqual(htm.parse_marker_map(""), {})
-        self.assertEqual(htm.parse_marker_map(None), {})
-
-    def test_broken_json_returns_empty_dict(self):
-        # 設定ミスで hook 全体が落ちないこと
-        self.assertEqual(htm.parse_marker_map("{not json"), {})
-
-    def test_non_mapping_returns_empty_dict(self):
-        self.assertEqual(htm.parse_marker_map('["a"]'), {})
-
-    def test_drops_non_string_values(self):
-        self.assertEqual(htm.parse_marker_map('{"a": 1, "b": "🔧"}'), {"b": "🔧"})
 
 
 class TestLooksLikeProse(unittest.TestCase):
