@@ -55,11 +55,53 @@ N 回ごとに作り直す従来動作に戻る（後方互換）。
 
 ## 必要なもの
 
-- herdr のペイン内で動いている Claude Code か Codex（`HERDR_ENV=1` が立っていること）
-- `python3`（標準ライブラリのみ）
+- 次のどちらかの中で動いている Claude Code か Codex
+  - herdr（TUI）のペイン（`HERDR_ENV=1` と `HERDR_SOCKET_PATH` が立っている）
+  - Herdr のデスクトップアプリ（herdr core）のターミナル（`HC_TERMINAL_ID` が立っている）
+- `python3`（標準ライブラリのみ。`fcntl` と `fork` を使うので Mac / Linux / WSL。Windows ネイティブの Python は非対応）
 - タイトル生成を使う場合は `PATH` の通った `claude`
 
-herdr の外で起動された場合は何もせずに終了する。
+herdr の外で起動された場合は何もせずに終了する。両方の環境変数が見えるとき（herdr TUI を
+デスクトップアプリのターミナルの中で動かしたとき）は、内側の herdr TUI のタブに名前を付ける。
+
+## デスクトップアプリ（herdr core）
+
+デスクトップアプリの裏で動くのは herdr TUI のサーバーではなく、別製品の **herdr-core**（`hc`）。
+中のターミナルには `HERDR_ENV` も `HERDR_SOCKET_PATH` も渡らない。そこで次の経路で名前を付ける。
+
+1. `herdr-core connect`（stdin/stdout で JSON-RPC を話す公式の入口）を起動する
+2. `terminal.get(HC_TERMINAL_ID)` のラベル `herdr.tab` で、自分のタブ ID を知る
+3. アプリが hc に保存している文書 `herdr-app` の `spaces[].tabs[].name` を、
+   `doc.get` → `doc.set`（version 一致の確認付き）で書き換える。アプリは doc event を受けて画面を更新する
+
+- 空の名前とアプリの自動命名（`Claude Code` / `Codex`）は、herdr TUI の連番と同じく上書きしてよい名前として扱う
+- 所有権の記録は `tabs/hc_<タブ ID>.json`（herdr TUI のタブと混ざらないよう `hc:` を付けている）
+- 文書 `herdr-app` はアプリ内部の形式なので、想定と違う形なら何もせずに終わる
+- hc 0.1.18 / Herdr.app 0.1.13（macOS）で確認した
+
+### herdr-core の探し方
+
+| 順 | 候補 | 備考 |
+|----|------|------|
+| 1 | `HERDR_TAB_MARKER_HC_BIN` | 明示。`:` 区切りで複数可 |
+| 2 | `PATH` 上の `herdr-core` | |
+| 3 | `~/.local/bin/herdr-core` | macOS / Linux のインストール先 |
+| 4 | `PATH` 上の `herdr-core.exe` | **WSL のみ**。Windows 版を interop で起動する |
+| 5 | `/mnt/c/Users/*/AppData/Local/Programs/herdr-core/herdr-core.exe` | **WSL のみ**。Windows 版の既定のインストール先 |
+
+ターミナル番号（`t7` など）は hc ごとの連番なので、WSL で Linux 版と Windows 版の両方があると
+別のターミナルを拾いうる。そのため **ターミナルの pid が自分の祖先プロセスにある hc** を優先し、
+それが無いとき（Windows 版の pid は WSL から確かめられない）は、該当するターミナルを返した hc が
+1 つだけの場合に限って使う。タブの文書は、ターミナルとは別の hc にあってもよい
+（Windows のアプリが WSL を `hc machine add` でつないでいる場合など）。
+
+### WSL で動かないとき
+
+- **`HC_TERMINAL_ID` が WSL に届いていない**: Windows のプロセスから `wsl.exe` を起動すると、
+  環境変数は `WSLENV` に書いたものしか引き継がれない。WSL の中で `echo $HC_TERMINAL_ID` が空なら、
+  Windows のユーザー環境変数 `WSLENV` に `HC_TERMINAL_ID` を足す（既にあれば `:` でつなぐ）
+- **herdr-core が見つからない**: `HERDR_TAB_MARKER_HC_BIN` に Windows 版の exe のパス（`/mnt/c/...`）を渡す
+- `HERDR_TAB_MARKER_DEBUG=1` で `debug.log` に、どこで諦めたかが出る
 
 ## 使い方
 
@@ -103,6 +145,7 @@ herdr の外で起動された場合は何もせずに終了する。
 | `HERDR_TAB_MARKER_DEBUG` | `0` | `~/.claude/herdr-tab-marker/debug.log` に出力 |
 | `HERDR_TAB_MARKER_FOREGROUND` | `0` | daemonize せず前景で実行（デバッグ用） |
 | `HERDR_TAB_MARKER_DISABLE` | `0` | 一時的に無効化 |
+| `HERDR_TAB_MARKER_HC_BIN` | （なし） | herdr-core の実行ファイル（デスクトップアプリ用。`:` 区切りで複数可） |
 
 ## サイドバーで複数の Claude を見分ける
 

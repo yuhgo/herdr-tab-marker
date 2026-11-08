@@ -13,10 +13,12 @@ Claude Code / Codex の UserPromptSubmit hook として呼ばれる。herdr の�
 from __future__ import annotations
 
 import fcntl
+import glob
 import json
 import locale
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -24,7 +26,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 SOURCE = "herdr-tab-marker"
 
 # ---------------------------------------------------------------- 設定
@@ -226,6 +228,303 @@ def rename_tab(tab_id: str, label: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- herdr core（デスクトップアプリ）
+#
+# Herdr.app（デスクトップ版）の裏で動くのは herdr TUI のサーバーではなく、別製品の
+# herdr-core（hc）。中のターミナルには HERDR_ENV も HERDR_SOCKET_PATH も渡らず、
+# 渡るのは HC_TERMINAL_ID だけ。タブはアプリが hc に保存する文書 `herdr-app` の
+# spaces[].tabs[] にあり、ターミナルとは labels["herdr.tab"] でつながっている。
+# 外から doc.set で書き換えると、アプリは doc event を受けて画面を更新する
+# （hc 0.1.18 / Herdr.app 0.1.13 で確認）。
+
+HC_DOC_NAME = "herdr-app"
+HC_TAB_LABEL = "herdr.tab"
+# 状態ファイルのキー。herdr TUI のタブ ID（w1:t4）と混ざらないよう接頭辞を付ける
+HC_KEY_PREFIX = "hc:"
+HC_TIMEOUT_SEC = 10
+HC_SET_RETRIES = 3
+# アプリが自動で付けるタブ名。空と同じく「人が付けた名前ではない」として扱う
+HC_AUTO_NAMES = frozenset({"Claude Code", "Codex"})
+
+# daemonize すると親が init に付け替わり祖先をたどれなくなるので、fork 前に記録する
+_ANCESTOR_PIDS: frozenset = frozenset()
+
+
+def is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+
+
+def _which(name: str, path: str | None = None) -> str | None:
+    found = shutil.which(name, path=path)
+    return found if found else None
+
+
+def hc_candidates() -> list:
+    """herdr-core の実行ファイルの候補を、手元に近い順に返す。
+
+    - Mac / Linux: PATH 上の herdr-core、なければ ~/.local/bin/herdr-core
+    - WSL: Linux 版に加えて、Windows 版の herdr-core.exe（interop で直接起動できる）。
+      Windows でアプリを使うと、タブの文書は Windows 側の hc にある
+    - HERDR_TAB_MARKER_HC_BIN で明示したものは最優先（os.pathsep 区切りで複数可）
+    """
+    raw = []
+    raw.extend(p for p in _env("HC_BIN").split(os.pathsep) if p)
+    raw.append(_which("herdr-core"))
+    raw.append(str(Path.home() / ".local" / "bin" / "herdr-core"))
+    if is_wsl():
+        raw.append(_which("herdr-core.exe"))
+        raw.extend(
+            sorted(glob.glob("/mnt/c/Users/*/AppData/Local/Programs/herdr-core/herdr-core.exe"))
+        )
+    seen = set()
+    result = []
+    for path in raw:
+        if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+            continue
+        key = os.path.realpath(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def hc_rpc(binary: str, calls: list, timeout: float = HC_TIMEOUT_SEC) -> list:
+    """`herdr-core connect` を 1 回起動し、JSON-RPC をまとめて投げる。
+
+    hc は環境変数でソケットの場所を教えてくれないので、ソケットへ直接つながず
+    公式の入口（stdin/stdout で API を話す connect）を使う。
+    返り値は calls と同じ順の応答（取れなかったものは None）。
+    """
+    lines = "".join(
+        json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params}) + "\n"
+        for i, (method, params) in enumerate(calls)
+    )
+    try:
+        proc = subprocess.run(
+            [binary, "connect"],
+            input=lines,
+            capture_output=True,
+            # Windows 版の exe も UTF-8 の JSON を返す。ロケール既定に任せると化ける
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=child_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"hc connect failed ({binary}): {exc}")
+        return [None] * len(calls)
+    by_id = {}
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            log(f"hc bad response ({binary}): {line[:200]}")
+            continue
+        if isinstance(message, dict) and isinstance(message.get("id"), int):
+            by_id[message["id"]] = message
+    return [by_id.get(i) for i in range(len(calls))]
+
+
+def _hc_result(response) -> dict | None:
+    if not isinstance(response, dict):
+        return None
+    if response.get("error"):
+        log(f"hc error: {response['error']}")
+        return None
+    result = response.get("result")
+    return result if isinstance(result, dict) else None
+
+
+def _hc_error_kind(response) -> str | None:
+    error = (response or {}).get("error") if isinstance(response, dict) else None
+    if not isinstance(error, dict):
+        return None
+    data = error.get("data")
+    return data.get("kind") if isinstance(data, dict) else None
+
+
+def hc_find_tab(doc_value, tab_id: str) -> dict | None:
+    """文書 `herdr-app` の中から tab_id のタブを探す。
+
+    文書は hc から見れば opaque（アプリ内部の形式）なので、想定と違う形なら None を返して
+    何もしない。アプリの更新で形が変わっても、壊すより諦めるほうを選ぶ。
+    """
+    if not isinstance(doc_value, dict):
+        return None
+    spaces = doc_value.get("spaces")
+    if not isinstance(spaces, list):
+        return None
+    for space in spaces:
+        tabs = space.get("tabs") if isinstance(space, dict) else None
+        if not isinstance(tabs, list):
+            continue
+        for tab in tabs:
+            if not isinstance(tab, dict) or tab.get("id") != tab_id:
+                continue
+            if isinstance(tab.get("name"), str):
+                return tab
+    return None
+
+
+def ancestor_pids() -> frozenset:
+    """自分の祖先プロセスの pid を集める（自分は含めない）。"""
+    parents = {}
+    proc = Path("/proc")
+    if proc.is_dir():
+        for stat in proc.glob("[0-9]*/stat"):
+            try:
+                # comm に空白や括弧が入りうるので、最後の ')' より後ろを読む
+                fields = stat.read_text().rsplit(")", 1)[1].split()
+                parents[int(stat.parent.name)] = int(fields[1])
+            except (OSError, IndexError, ValueError):
+                continue
+    else:
+        try:
+            out = subprocess.run(
+                ["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=5
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                parents[int(parts[0])] = int(parts[1])
+    result = set()
+    pid = os.getppid()
+    while pid > 1 and pid not in result:
+        result.add(pid)
+        pid = parents.get(pid, 0)
+    return frozenset(result)
+
+
+class HerdrTab:
+    """herdr TUI のタブ（Unix ソケット API）。"""
+
+    def __init__(self, tab_id: str):
+        self.tab_id = tab_id
+        self.key = tab_id
+
+    def label(self) -> str | None:
+        return get_tab_label(self.tab_id)
+
+    def rename(self, label: str) -> bool:
+        return rename_tab(self.tab_id, label)
+
+
+class HcTab:
+    """herdr core（デスクトップアプリ）のタブ。名前は文書 `herdr-app` にある。"""
+
+    def __init__(self, binary: str, tab_id: str):
+        self.binary = binary
+        self.tab_id = tab_id
+        self.key = HC_KEY_PREFIX + tab_id
+
+    def _get(self) -> tuple:
+        result = _hc_result(hc_rpc(self.binary, [("doc.get", {"name": HC_DOC_NAME})])[0])
+        if result is None:
+            return None, None
+        return result.get("value"), result.get("version")
+
+    def label(self) -> str | None:
+        value, _ = self._get()
+        tab = hc_find_tab(value, self.tab_id)
+        if tab is None:
+            return None
+        name = tab["name"]
+        # アプリの自動命名は空と同じ扱いにして、タイトルで置き換えてよいことにする
+        return "" if name.strip() in HC_AUTO_NAMES else name
+
+    def rename(self, label: str) -> bool:
+        """version を添えて書く（CAS）。アプリと同時に書いても相手の変更は消さない。"""
+        for _ in range(HC_SET_RETRIES):
+            value, version = self._get()
+            tab = hc_find_tab(value, self.tab_id)
+            if tab is None or not isinstance(version, int):
+                log(f"hc tab {self.tab_id} not found in doc {HC_DOC_NAME!r}")
+                return False
+            tab["name"] = label
+            params = {"name": HC_DOC_NAME, "value": value, "version": version}
+            response = hc_rpc(self.binary, [("doc.set", params)])[0]
+            if _hc_error_kind(response) == "conflict":
+                log("hc doc.set conflict; retrying with the latest version")
+                continue
+            return _hc_result(response) is not None
+        log(f"hc doc.set kept conflicting after {HC_SET_RETRIES} tries")
+        return False
+
+
+def resolve_hc_tab(terminal_id: str, ancestors: frozenset | None = None) -> HcTab | None:
+    """HC_TERMINAL_ID からタブを特定する。
+
+    ターミナル番号（t7 など）は hc ごとの連番なので、WSL で Linux 版と Windows 版の両方が
+    あると別物の t7 を拾いうる。そこで次の順で確かめる。
+      1. ターミナルの pid が自分の祖先にある hc（確実に自分のターミナル）
+      2. 1 が無ければ、herdr.tab ラベルを持つターミナルを返した hc がちょうど 1 つのとき
+         （Windows 版の pid は WSL から確かめられない）
+    タブの文書は、ターミナルとは別の hc にありうる（Windows のアプリが WSL をマシンとして
+    つないでいる場合など）ので、タブ ID が見つかる文書を候補から改めて探す。
+    """
+    if ancestors is None:
+        ancestors = _ANCESTOR_PIDS
+    candidates = hc_candidates()
+    if not candidates:
+        log("HC_TERMINAL_ID is set but herdr-core was not found")
+        return None
+    seen = []  # (binary, tab_id, pid が祖先にあるか, doc の value)
+    for binary in candidates:
+        terminal, doc = hc_rpc(
+            binary,
+            [("terminal.get", {"terminal": terminal_id}), ("doc.get", {"name": HC_DOC_NAME})],
+        )
+        terminal = _hc_result(terminal) or {}
+        labels = terminal.get("labels")
+        tab_id = labels.get(HC_TAB_LABEL) if isinstance(labels, dict) else None
+        value = (_hc_result(doc) or {}).get("value")
+        seen.append((binary, tab_id if isinstance(tab_id, str) else None,
+                     terminal.get("pid") in ancestors, value))
+    strong = [s for s in seen if s[1] and s[2]]
+    weak = [s for s in seen if s[1]]
+    if strong:
+        tab_id = strong[0][1]
+    elif len(weak) == 1:
+        tab_id = weak[0][1]
+    else:
+        log(f"hc terminal {terminal_id}: {len(weak)} candidates matched; cannot pick one")
+        return None
+    for binary, _, _, value in seen:
+        if hc_find_tab(value, tab_id) is not None:
+            return HcTab(binary, tab_id)
+    log(f"hc tab {tab_id} not found in any {HC_DOC_NAME!r} doc")
+    return None
+
+
+def resolve_tab():
+    """このプロセスがいるタブを返す。herdr TUI を herdr core より優先する。
+
+    herdr TUI を herdr core のターミナルの中で動かすと両方の環境変数が見えるが、
+    名前を付けたいのは内側（herdr TUI）のタブなので。
+    """
+    terminal_id = os.environ.get("HC_TERMINAL_ID")
+    # herdr core の中に古い HERDR_SOCKET_PATH だけ残っているときは herdr core を選ぶ
+    if os.environ.get("HERDR_SOCKET_PATH") and (
+        os.environ.get("HERDR_ENV") == "1" or not terminal_id
+    ):
+        tab_id = resolve_tab_id()
+        return HerdrTab(tab_id) if tab_id else None
+    if terminal_id:
+        return resolve_hc_tab(terminal_id)
+    return None
+
+
 # ---------------------------------------------------------------- 会話ログ
 
 
@@ -402,6 +701,7 @@ def child_env() -> dict:
         "HERDR_TAB_ID",
         "HERDR_WORKSPACE_ID",
         "HERDR_SOCKET_PATH",
+        "HC_TERMINAL_ID",
     ):
         env.pop(key, None)
     env.pop("CLAUDECODE", None)
@@ -785,10 +1085,12 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     state["prompt_count"] = prompt_count
     save_state(path, state)
 
-    tab_id = resolve_tab_id()
-    if not tab_id:
+    tab = resolve_tab()
+    if tab is None:
         log("cannot resolve tab id; giving up")
         return
+    # 状態ファイルのキー（herdr core のタブには hc: が付く）
+    tab_id = tab.key
 
     # 所有権はタブに紐づく。セッションを跨いでも自分の名前だと分かるようにする
     tab_path = tab_state_path(tab_id)
@@ -801,7 +1103,7 @@ def _run_locked(hook_input: dict, path: Path) -> None:
 
     log(f"tab={tab_id} prompt={prompt_count}")
 
-    current_label = get_tab_label(tab_id)
+    current_label = tab.label()
     # 0.1.x は先頭にリポジトリの絵文字を付けていた。そのとき付けた絵文字だけは剥がしてから比べる
     # （剥がさないと、自分が付けた名前を手動ラベルと誤認して二度と更新できなくなる）
     current_title = strip_legacy_marker(current_label, tab_state.get("marker") or state.get("marker"))
@@ -842,7 +1144,7 @@ def _run_locked(hook_input: dict, path: Path) -> None:
     if new_label == current_label:
         log(f"label already {new_label!r}; no rename needed")
         return
-    if rename_tab(tab_id, new_label):
+    if tab.rename(new_label):
         state["tab_id"] = tab_id
         state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         save_state(path, state)
@@ -899,14 +1201,21 @@ def main() -> int:
 
     if _env_flag("DISABLE"):
         return 0
-    # herdr の外では何もしない
-    if os.environ.get("HERDR_ENV") != "1":
-        return 0
-    if not os.environ.get("HERDR_SOCKET_PATH"):
+    # herdr の外では何もしない。
+    # herdr TUI は HERDR_ENV / HERDR_SOCKET_PATH を、herdr core（デスクトップアプリ）は
+    # HC_TERMINAL_ID だけを渡す
+    in_herdr = os.environ.get("HERDR_ENV") == "1"
+    in_hc = bool(os.environ.get("HC_TERMINAL_ID"))
+    if in_herdr and not os.environ.get("HERDR_SOCKET_PATH"):
         log("HERDR_SOCKET_PATH is not set; giving up")
+        return 0
+    if not in_herdr and not in_hc:
         return 0
     if not TITLE_ENABLED:
         return 0
+    if not in_herdr:
+        global _ANCESTOR_PIDS
+        _ANCESTOR_PIDS = ancestor_pids()
 
     if FOREGROUND:
         run(hook_input)
