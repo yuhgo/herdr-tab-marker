@@ -53,6 +53,23 @@ state_path.write_text(json.dumps(state))
 '''
 
 
+# Windows 版 herdr-core.exe の connect は、stdin が閉じた瞬間に未回答のまま終わる（2026-11-10 実測）。
+# その振る舞いを真似る偽物。返事は少し遅らせ、stdin の EOF を見たら即座に終わる。
+EAGER_EXIT_CORE = r'''
+import json, os, queue, sys, threading, time
+requests = queue.Queue()
+def reader():
+    for line in sys.stdin:
+        requests.put(json.loads(line))
+    os._exit(0)
+threading.Thread(target=reader, daemon=True).start()
+while True:
+    req = requests.get()
+    time.sleep(0.2)
+    print(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {"ok": req["method"]}}), flush=True)
+'''
+
+
 def doc_with(*tabs):
     return {
         "spaces": [
@@ -96,6 +113,17 @@ class TestHcRpc(unittest.TestCase):
         )
         self.assertEqual(terminal_resp["result"]["labels"]["herdr.tab"], "tb1")
         self.assertEqual(doc_resp["result"]["version"], 3)
+
+    def test_waits_for_replies_before_closing_stdin(self):
+        """stdin の EOF で即終了する hc（Windows 版）でも、返事を受け取ってから閉じる。"""
+        d = Path(tempfile.mkdtemp())
+        script = d / "core.py"
+        script.write_text(EAGER_EXIT_CORE)
+        core = d / "herdr-core"
+        core.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+        core.chmod(core.stat().st_mode | stat.S_IXUSR)
+        responses = htm.hc_rpc(str(core), [("terminal.get", {}), ("doc.get", {})], timeout=5)
+        self.assertEqual([r["result"]["ok"] for r in responses], ["terminal.get", "doc.get"])
 
     def test_missing_binary_returns_nones(self):
         self.assertEqual(htm.hc_rpc("/nonexistent/herdr-core", [("doc.get", {})]), [None])

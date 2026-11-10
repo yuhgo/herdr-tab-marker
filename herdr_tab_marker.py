@@ -18,6 +18,7 @@ import json
 import locale
 import os
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -26,7 +27,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 SOURCE = "herdr-tab-marker"
 
 # ---------------------------------------------------------------- 設定
@@ -305,32 +306,64 @@ def hc_rpc(binary: str, calls: list, timeout: float = HC_TIMEOUT_SEC) -> list:
         json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params}) + "\n"
         for i, (method, params) in enumerate(calls)
     )
+    # stdin は全部の返事を受け取るまで閉じない。Windows 版の herdr-core.exe は stdin の EOF で
+    # 未回答のまま終わるので、書いてすぐ閉じる（subprocess.run(input=...)）と何も返らない
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [binary, "connect"],
-            input=lines,
-            capture_output=True,
-            # Windows 版の exe も UTF-8 の JSON を返す。ロケール既定に任せると化ける
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             env=child_env(),
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except OSError as exc:
         log(f"hc connect failed ({binary}): {exc}")
         return [None] * len(calls)
     by_id = {}
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    deadline = time.monotonic() + timeout
+    buffer = b""
+    try:
+        proc.stdin.write(lines.encode("utf-8"))
+        proc.stdin.flush()
+        fd = proc.stdout.fileno()
+        while len(by_id) < len(calls):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log(f"hc connect timed out ({binary})")
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            buffer += chunk
+            *complete, buffer = buffer.split(b"\n")
+            for raw in complete:
+                # Windows 版の exe も UTF-8 の JSON を返す。ロケール既定に任せると化ける
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    log(f"hc bad response ({binary}): {line[:200]}")
+                    continue
+                if isinstance(message, dict) and isinstance(message.get("id"), int):
+                    by_id[message["id"]] = message
+    except OSError as exc:
+        log(f"hc connect failed ({binary}): {exc}")
+    finally:
         try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            log(f"hc bad response ({binary}): {line[:200]}")
-            continue
-        if isinstance(message, dict) and isinstance(message.get("id"), int):
-            by_id[message["id"]] = message
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
     return [by_id.get(i) for i in range(len(calls))]
 
 
